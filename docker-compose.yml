@@ -1,0 +1,50 @@
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: localllm-ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    environment:
+      - OLLAMA_HOST=0.0.0.0:11434
+    volumes:
+      - ollama_data:/root/.ollama
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:11434/api/tags" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 8G
+        reservations:
+          cpus: '2'
+          memory: 4G
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        echo "================================"
+        echo "Starting Ollama service..."
+        echo "================================"
+        ollama serve &
+        SERVER_PID=$$!
+        sleep 10
+        echo ""
+        echo "================================"
+        echo "Downloading llama3.2:3b model..."
+        echo "This may take a few minutes..."
+        echo "================================"
+        ollama pull llama3.2:3b
+        echo ""
+        echo "================================"
+        echo "✓ Model ready! You can now run:"
+        echo "  python main.py"
+        echo "================================"
+        wait $$SERVER_PID
+
+volumes:
+  ollama_data:
