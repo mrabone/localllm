@@ -49,7 +49,7 @@ Personal project where I experiment with LLMs locally.
    pip install -r requirements.txt
    ```
 
-3. **Run the chat application:**
+3. **Run the chat application:** 
    ```bash
    uv run main.py
    ```
