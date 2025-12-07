@@ -66,6 +66,16 @@ Personal project where I experiment with LLMs locally.
 docker-compose down
 ```
 
+## Development
+
+### Dependency Management
+
+If you modify the dependencies in `pyproject.toml`, you can regenerate the `requirements.txt` file by running:
+
+```bash
+make requirements
+```
+
 ## Configuration
 
 The application uses these environment variables (with defaults):
