@@ -41,8 +41,7 @@ services:
         ollama pull llama3.2:3b
         echo ""
         echo "================================"
-        echo "✓ Model ready! You can now run:"
-        echo "  python main.py"
+        echo "✓ Model ready! You can now run your application"
         echo "================================"
         wait $$SERVER_PID
 

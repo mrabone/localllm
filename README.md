@@ -38,7 +38,7 @@ Personal project where I experiment with LLMs locally.
    docker logs localllm-ollama
    ```
 
-   Wait for the message `✓ Model ready! You can now run: python main.py` before going to the next step.
+   Wait for the message `✓ Model ready! You can now run your application` before going to the next step.
 
 2. **Install Python dependencies:**
    ```bash
