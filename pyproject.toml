@@ -1,7 +1,7 @@
 [project]
 name = "localllm"
 version = "0.1.0"
-description = "Add your description here"
+description = "Personal project where I experiment with LLMs locally"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
