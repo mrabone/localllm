@@ -72,6 +72,7 @@ The application uses these environment variables (with defaults):
 
 - `OLLAMA_HOST`: Ollama API endpoint (default: `http://127.0.0.1:11434`)
 - `OLLAMA_MODEL`: Model to use (default: `llama3.2:3b`)
+- `OLLAMA_CONTEXT_LENGTH`: Context window size for Ollama models (default: `4096`)
 
 You can override these values by running:
 ```bash
