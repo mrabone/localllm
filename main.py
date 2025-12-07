@@ -146,8 +146,13 @@ def main():
     ollama_host = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
     model = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
 
-    app = ChatApplication(ollama_host=ollama_host, model=model)
-    app.run()
+    try:
+        app = ChatApplication(ollama_host=ollama_host, model=model)
+        app.run()
+    except Exception as e:
+        print(f"Error: Failed to connect to Ollama at {ollama_host}")
+        print(f"Details: {e}")
+        exit(1)
 
 
 if __name__ == "__main__":
