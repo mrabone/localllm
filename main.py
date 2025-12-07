@@ -1,6 +1,6 @@
 import os
 from ollama import Client
-from ollama import ChatResponse
+from typing import Generator
 
 # ANSI color codes
 GREEN = "\033[92m"
@@ -89,13 +89,13 @@ class ChatApplication:
 
         return [system_prompt] + recent_messages
 
-    def _send_message(self, context_messages: list) -> str:
-        """Send messages to Ollama and get a response."""
-        response: ChatResponse = self.client.chat(
-            model=self.model,
-            messages=context_messages,
+    def _send_message(self, context_messages: list) -> Generator[str, None, None]:
+        """Send messages to Ollama and stream the response."""
+        stream = self.client.chat(
+            model=self.model, messages=context_messages, stream=True
         )
-        return response.message.content
+        for chunk in stream:
+            yield chunk["message"]["content"]
 
     def add_user_message(self, content: str) -> None:
         """Add a user message to the conversation history."""
@@ -105,13 +105,11 @@ class ChatApplication:
         """Add an assistant message to the conversation history."""
         self.messages.append({"role": "assistant", "content": content})
 
-    def chat(self, user_input: str) -> str:
-        """Process user input and return assistant response."""
+    def chat(self, user_input: str) -> Generator[str, None, None]:
+        """Process user input and stream the assistant's response."""
         self.add_user_message(user_input)
         context_messages = self._manage_conversation_history()
-        assistant_message = self._send_message(context_messages)
-        self.add_assistant_message(assistant_message)
-        return assistant_message
+        return self._send_message(context_messages)
 
     def run(self) -> None:
         """Run the interactive chat loop."""
@@ -120,19 +118,24 @@ class ChatApplication:
 
         while True:
             try:
-                # Get user input
                 user_input = input(f"{GREEN}❯{RESET} ").strip()
-
                 if not user_input:
                     continue
-
                 if user_input.lower() in ["quit", "exit"]:
                     print("Goodbye!")
                     break
 
-                # Get response from chat
-                assistant_message = self.chat(user_input)
-                print(f"\n{CYAN}{BOLD}Assistant:{RESET}\n{assistant_message}\n")
+                print(f"\n{CYAN}{BOLD}Assistant:{RESET}")
+                assistant_message = ""
+                # Stream the response from the chat method
+                stream = self.chat(user_input)
+                for chunk in stream:
+                    assistant_message += chunk
+                    print(chunk, end="", flush=True)
+
+                # Add the complete assistant message to the history
+                self.add_assistant_message(assistant_message)
+                print("\n")
 
             except KeyboardInterrupt:
                 print("\n\nGoodbye!")
