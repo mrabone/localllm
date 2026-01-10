@@ -13,7 +13,9 @@ class ChatApplication:
     """Interactive chat application with Ollama."""
 
     def __init__(
-        self, ollama_host: str = "http://127.0.0.1:11434", model: str = "llama3.2:3b"
+        self,
+        ollama_host: str = "http://127.0.0.1:11434",
+        model: str = "custom-llama3.2",
     ):
         """Initialize the chat application with Ollama client and configuration."""
         self.client = Client(host=ollama_host)
@@ -22,22 +24,6 @@ class ChatApplication:
         self.messages = []
         self.max_recent = 10
         self.threshold = 20
-
-    def _get_system_prompt(self) -> dict:
-        """Return the system prompt that guides the assistant's behavior."""
-        return {
-            "role": "system",
-            "content": (
-                "You are a helpful and friendly assistant with a great sense of humor. Your goal is to provide "
-                "accurate, thoughtful responses while keeping things light and engaging. Always:\n"
-                "- Be clear and concise\n"
-                "- Don't be afraid to be a bit witty or use casual language when appropriate\n"
-                "- Admit when you don't know something\n"
-                "- Ask clarifying questions if needed\n"
-                "- Maintain a respectful and approachable tone\n"
-                "- Help people while making the conversation enjoyable"
-            ),
-        }
 
     def _summarize_messages(self, messages_to_summarize: list) -> dict | None:
         """Summarize a list of messages into a single message."""
@@ -67,15 +53,13 @@ class ChatApplication:
 
         return {
             "role": "system",
-            "content": f"[Earlier conversation summary]: {response.message.content}",
+            "content": f"[Earlier conversation summary]: {response['message']['content']}",
         }
 
     def _manage_conversation_history(self) -> list:
         """Manage conversation history by summarizing old messages when threshold is reached."""
-        system_prompt = self._get_system_prompt()
-
         if len(self.messages) <= self.threshold:
-            return [system_prompt] + self.messages
+            return self.messages
 
         # Keep the last max_recent messages as-is
         recent_messages = self.messages[-self.max_recent :]
@@ -85,9 +69,9 @@ class ChatApplication:
         if old_messages:
             summary = self._summarize_messages(old_messages)
             if summary:
-                return [system_prompt, summary] + recent_messages
+                return [summary] + recent_messages
 
-        return [system_prompt] + recent_messages
+        return recent_messages
 
     def _send_message(self, context_messages: list) -> Generator[str, None, None]:
         """Send messages to Ollama and stream the response."""
@@ -147,7 +131,7 @@ class ChatApplication:
 
 def main():
     ollama_host = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
-    model = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
+    model = os.getenv("OLLAMA_MODEL", "custom-llama3.2")
 
     try:
         app = ChatApplication(ollama_host=ollama_host, model=model)

@@ -10,6 +10,7 @@ services:
       - OLLAMA_CONTEXT_LENGTH=8192
     volumes:
       - ollama_data:/root/.ollama
+      - ./Modelfile:/Modelfile
     healthcheck:
       test: [ "CMD", "curl", "-f", "http://localhost:11434/api/tags" ]
       interval: 5s
@@ -40,6 +41,11 @@ services:
         echo "This may take a few minutes..."
         echo "================================"
         ollama pull llama3.2:3b
+        echo ""
+        echo "================================"
+        echo "Creating custom model..."
+        echo "================================"
+        ollama create custom-llama3.2 -f /Modelfile
         echo ""
         echo "================================"
         echo "✓ Model ready! You can now run your application"
