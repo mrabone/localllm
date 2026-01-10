@@ -3,4 +3,4 @@ setup:
 run:
 	uv run main.py
 requirements:
-	uv pip compile pyproject.toml -o requirements.txt
+	uv pip compile pyproject.toml -o requirements.txt -U
