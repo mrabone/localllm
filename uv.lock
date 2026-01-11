@@ -2,6 +2,13 @@ version = 1
 revision = 3
 requires-python = ">=3.11"
 
+[manifest]
+members = [
+    "cli",
+    "localllm",
+    "rag",
+]
+
 [[package]]
 name = "annotated-types"
 version = "0.7.0"
@@ -32,6 +39,17 @@ sdist = { url = "https://files.pythonhosted.org/packages/e0/2d/a891ca51311197f6a
 wheels = [
     { url = "https://files.pythonhosted.org/packages/e6/ad/3cc14f097111b4de0040c83a525973216457bbeeb63739ef1ed275c1c021/certifi-2026.1.4-py3-none-any.whl", hash = "sha256:9943707519e4add1115f44c2bc244f782c0249876bf51b6599fee1ffbedd685c", size = 152900, upload-time = "2026-01-04T02:42:40.15Z" },
 ]
+
+[[package]]
+name = "cli"
+version = "0.1.0"
+source = { virtual = "cli" }
+dependencies = [
+    { name = "ollama" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "ollama", specifier = ">=0.6.1" }]
 
 [[package]]
 name = "h11"
@@ -83,12 +101,6 @@ wheels = [
 name = "localllm"
 version = "0.1.0"
 source = { virtual = "." }
-dependencies = [
-    { name = "ollama" },
-]
-
-[package.metadata]
-requires-dist = [{ name = "ollama", specifier = ">=0.6.1" }]
 
 [[package]]
 name = "ollama"
@@ -214,6 +226,11 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/88/9d/b06ca6acfe4abb296110fb1273a4d848a0bfb2ff65f3ee92127b3244e16b/pydantic_core-2.41.5-pp311-pypy311_pp73-musllinux_1_1_x86_64.whl", hash = "sha256:f14f8f046c14563f8eb3f45f499cc658ab8d10072961e07225e507adb700e93f", size = 2316992, upload-time = "2025-11-04T13:43:43.602Z" },
     { url = "https://files.pythonhosted.org/packages/36/c7/cfc8e811f061c841d7990b0201912c3556bfeb99cdcb7ed24adc8d6f8704/pydantic_core-2.41.5-pp311-pypy311_pp73-win_amd64.whl", hash = "sha256:56121965f7a4dc965bff783d70b907ddf3d57f6eba29b6d2e5dabfaf07799c51", size = 2145302, upload-time = "2025-11-04T13:43:46.64Z" },
 ]
+
+[[package]]
+name = "rag"
+version = "0.1.0"
+source = { virtual = "rag" }
 
 [[package]]
 name = "typing-extensions"
