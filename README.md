@@ -44,18 +44,18 @@ Personal project where I experiment with LLMs locally.
    ```bash
    uv sync
    ```
-   Or alternatively with pip:
+   Or using Make:
    ```bash
-   pip install -r requirements.txt
+   make sync-deps
    ```
 
 3. **Run the chat application:**
    ```bash
-   uv run main.py
+   uv run cli/main.py
    ```
-   Or alternatively with Python:
+   Or using Make:
    ```bash
-   python main.py
+   make run-cli
    ```
 
    The CLI will connect to the local Ollama instance and you can start chatting!
@@ -70,10 +70,12 @@ docker-compose down
 
 ### Dependency Management
 
-If you modify the dependencies in `pyproject.toml`, you can regenerate the `requirements.txt` file by running:
+The project is organized as a workspace with multiple members (`cli`, `rag`).
+
+If you modify the dependencies in `cli/pyproject.toml` or `rag/pyproject.toml`, you can regenerate the `requirements.txt` files by running:
 
 ```bash
-make requirements
+make generate-requirements
 ```
 
 ## Configuration
@@ -82,11 +84,11 @@ The application uses these environment variables (with defaults):
 
 - `OLLAMA_HOST`: Ollama API endpoint (default: `http://127.0.0.1:11434`)
 - `OLLAMA_MODEL`: Model to use (default: `custom-chatbot-model`, based on `gemma3:4b`)
-- `OLLAMA_CONTEXT_LENGTH`: Context window size for Ollama models (default: `4096`)
+- `OLLAMA_CONTEXT_LENGTH`: Context window size for Ollama models (default: `8192`)
 
 You can override these values by running:
 ```bash
-OLLAMA_HOST=http://custom-host:11434 OLLAMA_MODEL=llama2 python main.py
+OLLAMA_HOST=http://custom-host:11434 OLLAMA_MODEL=llama2 uv run cli/main.py
 ```
 
 ### Changing the Model
@@ -105,7 +107,7 @@ OLLAMA_HOST=http://custom-host:11434 OLLAMA_MODEL=llama2 python main.py
 
 3. **Run the application with the new model:**
    ```bash
-   OLLAMA_MODEL=mistral uv run main.py
+   OLLAMA_MODEL=mistral uv run cli/main.py
    ```
 
 Note: Larger models may require more resources. Check the model's requirements and adjust `docker-compose.yml` resource limits if needed.
