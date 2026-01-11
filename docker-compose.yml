@@ -37,15 +37,9 @@ services:
         sleep 10
         echo ""
         echo "================================"
-        echo "Downloading llama3.2:3b model..."
-        echo "This may take a few minutes..."
-        echo "================================"
-        ollama pull llama3.2:3b
-        echo ""
-        echo "================================"
         echo "Creating custom model..."
         echo "================================"
-        ollama create custom-llama3.2 -f /Modelfile
+        ollama create custom-chatbot-model -f /Modelfile
         echo ""
         echo "================================"
         echo "✓ Model ready! You can now run your application"
