@@ -15,7 +15,7 @@ class ChatApplication:
     def __init__(
         self,
         ollama_host: str = "http://127.0.0.1:11434",
-        model: str = "custom-llama3.2",
+        model: str = "custom-chatbot-model",
     ):
         """Initialize the chat application with Ollama client and configuration."""
         self.client = Client(host=ollama_host)
@@ -131,7 +131,7 @@ class ChatApplication:
 
 def main():
     ollama_host = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
-    model = os.getenv("OLLAMA_MODEL", "custom-llama3.2")
+    model = os.getenv("OLLAMA_MODEL", "custom-chatbot-model")
 
     try:
         app = ChatApplication(ollama_host=ollama_host, model=model)

@@ -30,7 +30,7 @@ Personal project where I experiment with LLMs locally.
    ```
    This will:
    - Start the Ollama container on `http://127.0.0.1:11434`
-   - Automatically download and load the `llama3.2:3b` model
+   - Automatically download `gemma3:4b` and create a custom model named `custom-chatbot-model`
    - Display progress in the logs
 
    Monitor the download progress:
@@ -81,7 +81,7 @@ make requirements
 The application uses these environment variables (with defaults):
 
 - `OLLAMA_HOST`: Ollama API endpoint (default: `http://127.0.0.1:11434`)
-- `OLLAMA_MODEL`: Model to use (default: `llama3.2:3b`)
+- `OLLAMA_MODEL`: Model to use (default: `custom-chatbot-model`, based on `gemma3:4b`)
 - `OLLAMA_CONTEXT_LENGTH`: Context window size for Ollama models (default: `4096`)
 
 You can override these values by running:
