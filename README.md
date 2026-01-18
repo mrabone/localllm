@@ -4,11 +4,12 @@ Personal project where I experiment with LLMs locally.
 
 ## Features
 
-- **Interactive CLI chat interface** - Have conversations with a local LLM in your terminal
-- **Conversation history management** - Automatically summarizes old messages when conversation gets long to maintain context
-- **Customizable system prompt** - The assistant has a friendly, helpful personality
-- **No internet required** - Everything runs locally with Docker and Ollama
-- **Flexible model selection** - Easy to switch between different Ollama models
+- **Interactive CLI chat interface** - Have conversations with a local LLM in your terminal.
+- **RAG Pipeline** - Populate a vector database with content from a list of websites.
+- **Conversation history management** - Automatically summarizes old messages when conversation gets long to maintain context.
+- **Customizable system prompt** - The assistant has a friendly, helpful personality.
+- **No internet required** - Everything runs locally with Docker and Ollama.
+- **Flexible model selection** - Easy to switch between different Ollama models.
 
 ## Quick Start
 
@@ -16,103 +17,116 @@ Personal project where I experiment with LLMs locally.
 
 - Docker and Docker Compose installed
 - Python 3.11+
-- `uv` (optional, but recommended for dependency management)
+- `uv` (recommended for dependency management)
 
 ### Running Locally with Docker
 
-1. **Start the Ollama service:**
-   ```bash
-   make setup
-   ```
-   Or alternatively with docker-compose:
-   ```bash
-   docker-compose up -d
-   ```
-   This will:
-   - Start the Ollama container on `http://127.0.0.1:11434`
-   - Automatically download `gemma3:4b` and create a custom model named `custom-chatbot-model`
-   - Display progress in the logs
+1.  **Configure Environment Variables:**
+    
+      Create a `.env` file from the example template:
 
-   Monitor the download progress:
-   ```bash
-   docker logs localllm-ollama
-   ```
+      ```bash
+      cp .env.example .env
+      ```
+      
+      You can then modify your `.env` file to change the default settings where necessary.
 
-   Wait for the message `✓ Model ready! You can now run your application` before going to the next step.
+2.  **Start Docker Services:**
+    ```bash
+    make setup
+    ```
+    This will start the Ollama and PostgreSQL containers.
 
-2. **Install Python dependencies:**
-   ```bash
-   uv sync
-   ```
-   Or using Make:
-   ```bash
-   make sync-deps
-   ```
+3.  **Install Dependencies:**
+    ```bash
+    make sync-deps
+    ```
 
-3. **Run the chat application:**
-   ```bash
-   uv run cli/main.py
-   ```
-   Or using Make:
-   ```bash
-   make run-cli
-   ```
+4.  **Run the RAG Pipeline:**
+         
+      To populate the vector database with the content from the test data file (`rag/src/rag/data/reading_list_test_data.json`):
 
-   The CLI will connect to the local Ollama instance and you can start chatting!
+      ```bash
+      make run-rag
+      ```
 
-### Stopping the Container/LLM
+5.  **Run the CLI Chat Application:**
+    ```bash
+    make run-cli
+    ```
+    The CLI will connect to the local Ollama instance and you can start chatting!
+
+### Stopping the Services
 
 ```bash
 docker-compose down
 ```
 
+## Configuration
+
+The application is configured via environment variables, which can be set in a `.env` file in the project root. An `.env.example` file is provided as a template.
+
+### Common
+
+-   `OLLAMA_BASE_URL`: The base URL for the Ollama API.
+
+### RAG Pipeline
+
+-   `PG_HOST`: The hostname of the PostgreSQL database.
+-   `PG_PORT`: The port of the PostgreSQL database.
+-   `PG_DATABASE`: The name of the database to use.
+-   `PG_USER`: The username for the database.
+-   `PG_PASSWORD`: The password for the database.
+-   `PG_COLLECTION_NAME`: The name of the collection (table) to store the embeddings in.
+-   `RAG_OLLAMA_MODEL`: The Ollama model to use for generating embeddings.
+-   `CONCURRENT_REQUESTS`: The number of concurrent requests to make when scraping websites.
+-   `REQUEST_DELAY`: The delay in seconds between requests.
+
+### CLI Application
+
+-   `CLI_OLLAMA_MODEL`: The Ollama model to use for the chat application.
+-   `CLI_MAX_RECENT`: The number of recent messages to keep in the conversation history before summarizing.
+-   `CLI_THRESHOLD`: The number of messages to keep in the conversation history before summarizing.
+
 ## Development
 
 ### Dependency Management
 
-The project is organized as a workspace with multiple members (`cli`, `rag`).
+The project is organized as a workspace with multiple members (`cli`, `rag`). Dependencies are defined in the `pyproject.toml` file for each project.
 
-If you modify the dependencies in `cli/pyproject.toml` or `rag/pyproject.toml`, you can regenerate the `requirements.txt` files by running:
-
+To install these dependencies, run:
 ```bash
-make generate-requirements
-```
-
-## Configuration
-
-The application uses these environment variables (with defaults):
-
-- `OLLAMA_HOST`: Ollama API endpoint (default: `http://127.0.0.1:11434`)
-- `OLLAMA_MODEL`: Model to use (default: `custom-chatbot-model`, based on `gemma3:4b`)
-- `OLLAMA_CONTEXT_LENGTH`: Context window size for Ollama models (default: `8192`)
-
-You can override these values by running:
-```bash
-OLLAMA_HOST=http://custom-host:11434 OLLAMA_MODEL=llama2 uv run cli/main.py
+make sync-deps
 ```
 
 ### Changing the Model
 
-1. **Find available models** on [Ollama's model library](https://ollama.com/library)
+1.  **Find available models** on [Ollama's model library](https://ollama.com/library).
 
-2. **Pull the model into your container:**
-   ```bash
-   docker exec localllm-ollama ollama pull <model-name>
-   ```
-   For example:
-   ```bash
-   docker exec localllm-ollama ollama pull llama2
-   docker exec localllm-ollama ollama pull mistral
-   ```
+2.  **Pull the model into your container:**
+    ```bash
+    docker compose exec ollama ollama pull <model-name>
+    ```
+    For example:
+    ```bash
+    docker compose exec ollama ollama pull llama2
+    docker compose exec ollama ollama pull mistral
+    ```
 
-3. **Run the application with the new model:**
-   ```bash
-   OLLAMA_MODEL=mistral uv run cli/main.py
-   ```
+3.  **Update your `.env` file:**
 
-Note: Larger models may require more resources. Check the model's requirements and adjust `docker-compose.yml` resource limits if needed.
+      Change the `CLI_OLLAMA_MODEL` or `RAG_OLLAMA_MODEL` variables to the new model name in the `.env` file like so:
 
-## Docker Resource Limits
+      ```
+      CLI_OLLAMA_MODEL=<model-name>
+      ```
+
+4.  **Run the application:**
+    ```bash
+    make run-cli
+    ```
+
+### Docker Resource Limits
 
 The `docker-compose.yml` includes resource constraints:
 - **CPU**: 4 cores max, 2 reserved
