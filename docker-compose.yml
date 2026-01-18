@@ -12,7 +12,7 @@ services:
       - ollama_data:/root/.ollama
       - ./Modelfile:/Modelfile
     healthcheck:
-      test: [ "CMD", "curl", "-f", "http://localhost:11434/api/tags" ]
+      test: [ "CMD", "curl", "-f", "http://127.0.0.1:11434/api/tags" ]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -20,8 +20,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '4'
-          memory: 8G
+          cpus: '6'
+          memory: 16G
         reservations:
           cpus: '2'
           memory: 4G
@@ -42,9 +42,34 @@ services:
         ollama create custom-chatbot-model -f /Modelfile
         echo ""
         echo "================================"
-        echo "✓ Model ready! You can now run your application"
+        echo "Pulling embedding model..."
+        echo "================================"
+        ollama pull embeddinggemma
+        echo ""
+        echo "================================"
+        echo "✓ Models ready! You can now run your application"
         echo "================================"
         wait $$SERVER_PID
 
+  db:
+    image: pgvector/pgvector:pg16
+    container_name: localllm-postgres
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: rag_db
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U user -d rag_db" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
 volumes:
   ollama_data:
+  db_data:
