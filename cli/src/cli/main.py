@@ -1,6 +1,7 @@
-import os
 from ollama import Client
 from typing import Generator
+
+from cli.config import settings
 
 # ANSI color codes
 GREEN = "\033[92m"
@@ -14,16 +15,18 @@ class ChatApplication:
 
     def __init__(
         self,
-        ollama_host: str = "http://127.0.0.1:11434",
-        model: str = "custom-chatbot-model",
+        ollama_host: str = settings.ollama_base_url,
+        model: str = settings.cli_ollama_model,
+        max_recent: int = settings.cli_max_recent,
+        threshold: int = settings.cli_threshold,
     ):
         """Initialize the chat application with Ollama client and configuration."""
         self.client = Client(host=ollama_host)
         self.model = model
         self.ollama_host = ollama_host
         self.messages = []
-        self.max_recent = 10
-        self.threshold = 20
+        self.max_recent = max_recent
+        self.threshold = threshold
 
     def _summarize_messages(self, messages_to_summarize: list) -> dict | None:
         """Summarize a list of messages into a single message."""
@@ -130,14 +133,11 @@ class ChatApplication:
 
 
 def main():
-    ollama_host = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
-    model = os.getenv("OLLAMA_MODEL", "custom-chatbot-model")
-
     try:
-        app = ChatApplication(ollama_host=ollama_host, model=model)
+        app = ChatApplication()
         app.run()
     except Exception as e:
-        print(f"Error: Failed to connect to Ollama at {ollama_host}")
+        print(f"Error: Failed to connect to Ollama at {settings.cli_ollama_host}")
         print(f"Details: {e}")
         exit(1)
 

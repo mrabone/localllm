@@ -1,7 +1,15 @@
 [tool.uv.workspace]
 members = ["cli", "rag"]
 
+[tool.uv.sources]
+cli = { workspace = true }
+rag = { workspace = true }
+
 [project]
 name = "localllm"
 version = "0.1.0"
 requires-python = ">=3.11"
+dependencies = [
+    "cli",
+    "rag",
+]
