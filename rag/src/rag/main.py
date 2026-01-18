@@ -105,7 +105,6 @@ async def process_item(
             return
     except Exception as e:
         logger.error(f"Error checking for existing documents for {url}: {e}")
-        # Decide if you want to continue or return. For now, we'll continue.
         pass
 
     # 2. Scrape HTML content
