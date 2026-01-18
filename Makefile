@@ -1,22 +1,16 @@
-PROJECTS = cli rag
+PROJECTS_DIRS = cli rag
 
-.PHONY: setup run-cli sync-deps generate-requirements up down
+.PHONY: setup run-cli sync-deps up down run-rag
 
 setup:
 	docker compose down && docker compose up
 
 run-cli:
-	uv run cli/main.py
+	uv run cli/src/cli/main.py
 
 sync-deps:
-	@echo "Syncing dependencies from requirements.txt files..."
-	@for project in $(PROJECTS); do \
-		uv pip sync --quiet $$project/requirements.txt; \
-	done
+	@echo "Syncing workspace dependencies..."
+	uv sync
 
-# Generates the requirements.txt lockfiles from pyproject.toml files.
-generate-requirements:
-	@echo "Generating requirements.txt for all projects..."
-	@for project in $(PROJECTS); do \
-		uv pip compile --quiet $$project/pyproject.toml -o $$project/requirements.txt -U; \
-	done
+run-rag:
+	uv run rag/src/rag/main.py
