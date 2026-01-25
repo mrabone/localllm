@@ -126,10 +126,3 @@ make sync-deps
     make run-cli
     ```
 
-### Docker Resource Limits
-
-The `docker-compose.yml` includes resource constraints:
-- **CPU**: 4 cores max, 2 reserved
-- **Memory**: 8GB max, 4GB reserved
-
-Adjust these in the `docker-compose.yml` file under the `deploy.resources` section if needed.
