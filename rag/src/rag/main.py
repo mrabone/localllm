@@ -17,6 +17,15 @@ from langchain_postgres import PGVector
 from rag.config import settings
 from rag.logging_utils import LoggingSetup
 
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.google.com/",
+}
+
+
 LoggingSetup.setup_logging()
 logger = logging.getLogger(__name__)
 
@@ -55,7 +64,7 @@ async def scrape_url(
         try:
             logger.info(f"Attempting to fetch URL: {url}")
             async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.get(url)
+                response = await client.get(url, headers=HEADERS)
                 response.raise_for_status()  # Raise an exception for 4xx/5xx responses
                 logger.info(f"Successfully fetched URL: {url}")
                 return response.text
