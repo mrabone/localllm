@@ -1,0 +1,56 @@
+[
+  {
+    "title": "RAG Series — Part 5: HyDE and HyPE",
+    "url": "https://medium.com/@hari.haran849/rag-series-5-25d5e57b9d8b",
+    "category": "Research",
+    "added_date": "2025-11-15T10:30:00Z"
+  },
+  {
+    "title": "Introducing LightRAG: A New Era in Retrieval Augmented Generation",
+    "url": "https://medium.com/knowledge-nexus-ai/introducing-lightrag-a-new-era-in-retrieval-augmented-generation-57c20d6081fa",
+    "category": "Research",
+    "added_date": "2025-11-20T14:20:00Z"
+  },
+  {
+    "title": "Build a custom RAG agent with LangGraph",
+    "url": "https://docs.langchain.com/oss/python/langgraph/agentic-rag",
+    "category": "Documentation",
+    "added_date": "2025-12-01T09:15:00Z"
+  },
+  {
+    "title": "Advanced RAG techniques with LangChain — Part 1",
+    "url": "https://medium.com/@roberto.g.infante/advanced-rag-techniques-with-langchain-f9c82290b0d1",
+    "category": "Learning",
+    "added_date": "2026-01-05T08:00:00Z"
+  },
+  {
+    "title": "Chunking Strategies for LLM Applications",
+    "url": "https://www.pinecone.io/learn/chunking-strategies/",
+    "category": "Research",
+    "added_date": "2025-10-10T11:45:00Z"
+  },
+  {
+    "title": "Semantic Chunking for RAG",
+    "url": "https://medium.com/the-ai-forum/semantic-chunking-for-rag-f4733025d5f5",
+    "category": "Research",
+    "added_date": "2026-01-10T16:30:00Z"
+  },
+  {
+    "title": "Introduction to LangChain",
+    "url": "https://medium.com/@vikrampande783/introduction-to-langchain-9e09aae37e62",
+    "category": "Learning",
+    "added_date": "2025-12-12T13:00:00Z"
+  },
+  {
+    "title": "Choosing and Implementing Hugging Face Models",
+    "url": "https://medium.com/data-science/choosing-and-implementing-hugging-face-models-026d71426fbe",
+    "category": "Research",
+    "added_date": "2026-01-02T10:10:00Z"
+  },
+  {
+    "title": "9 LLM Summarization Strategies to Maximize AI Output Quality",
+    "url": "https://galileo.ai/blog/llm-summarization-strategies",
+    "category": "Learning",
+    "added_date": "2025-11-28T15:45:00Z"
+  }
+]

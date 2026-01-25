@@ -1,6 +1,16 @@
+PROJECTS_DIRS = cli rag
+
+.PHONY: setup run-cli sync-deps up down run-rag
+
 setup:
 	docker compose down && docker compose up
-run:
-	uv run main.py
-requirements:
-	uv pip compile pyproject.toml -o requirements.txt -U
+
+run-cli:
+	uv run cli/src/cli/main.py
+
+sync-deps:
+	@echo "Syncing workspace dependencies..."
+	uv sync
+
+run-rag:
+	uv run rag/src/rag/main.py
