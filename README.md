@@ -5,7 +5,7 @@ Personal project where I experiment with LLMs locally.
 ## Features
 
 - **Interactive CLI chat interface** - Have conversations with a local LLM in your terminal, optionally enriched with your own data via RAG.
-- **RAG Pipeline** - Populate a vector database with content from a list of websites.
+- **Knowledge Base Integration** - Automatically import content from websites to let the assistant answer questions based on your custom data sources.
 - **Conversation history management** - Automatically summarizes old messages when conversation gets long to maintain context.
 - **Customizable system prompt** - The assistant has a friendly, helpful personality.
 - **No internet required** - Everything runs locally with Docker and Ollama.
