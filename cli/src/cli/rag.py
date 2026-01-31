@@ -13,11 +13,19 @@ def get_rag_context(query: str, pgvector_store: PGVector) -> str:
             query, k=settings.cli_rag_k
         )
 
-        # Filter results by threshold (lower score = more similar for L2 distance)
+        if not results:
+            return ""
+
+        # Check if the most relevant document (lowest score) is within the max distance
+        best_score = results[0][1]
+        if best_score > settings.cli_rag_max_distance:
+            return ""
+
+        # Filter results by max distance (lower score = more similar for L2 distance)
         filtered_results = [
             (doc, score)
             for doc, score in results
-            if score <= settings.cli_rag_threshold
+            if score <= settings.cli_rag_max_distance
         ]
 
         if not filtered_results:

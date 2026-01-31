@@ -5,7 +5,7 @@ from enum import Enum
 
 from cli.config import settings
 from cli.rag import get_rag_context, build_rag_prompt
-from cli.services import services
+from cli.services import ollama_client, pgvector_store
 
 
 class Role(Enum):
@@ -109,9 +109,6 @@ class ChatApplication:
 
     def chat(self, user_input: str) -> Generator[str, None, None]:
         """Process user input and stream the assistant's response."""
-        if not self.rag_enabled or not self.pgvector_store:
-            return self._prepare_and_send(user_input)
-
         context = get_rag_context(user_input, self.pgvector_store)
         if not context:
             return self._prepare_and_send(user_input)
@@ -162,8 +159,8 @@ def main():
     """Main entry point for the application."""
     try:
         app = ChatApplication(
-            ollama_client=services.get_ollama_client(),
-            pgvector_store=services.get_pgvector_store(),
+            ollama_client=ollama_client,
+            pgvector_store=pgvector_store,
         )
         app.run()
     except Exception as e:

@@ -14,7 +14,7 @@ class Settings(BaseSettings):
     cli_threshold: int = Field(default=20, alias="CLI_THRESHOLD")
     cli_enable_rag: bool = Field(default=False, alias="CLI_ENABLE_RAG")
     rag_ollama_model: str = Field(default="embeddinggemma", alias="RAG_OLLAMA_MODEL")
-    cli_rag_threshold: float = Field(default=0.4, alias="CLI_RAG_THRESHOLD")
+    cli_rag_max_distance: float = Field(default=0.4, alias="CLI_RAG_MAX_DISTANCE")
     cli_rag_k: int = Field(default=3, alias="CLI_RAG_K")
 
     # PGVector database settings (reused from RAG pipeline)
@@ -37,7 +37,7 @@ class Settings(BaseSettings):
             host=self.pg_host,
             port=self.pg_port,
             database=self.pg_database,
-        ).render_as_string(hide_password=False)
+        ).render_as_string(hide_password=True)
 
     class Config:
         env_file = ".env"
