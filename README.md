@@ -4,8 +4,8 @@ Personal project where I experiment with LLMs locally.
 
 ## Features
 
-- **Interactive CLI chat interface** - Have conversations with a local LLM in your terminal.
-- **RAG Pipeline** - Populate a vector database with content from a list of websites.
+- **Interactive CLI chat interface** - Have conversations with a local LLM in your terminal, optionally enriched with your own data via RAG.
+- **Knowledge Base Integration** - Automatically import content from websites to let the assistant answer questions based on your custom data sources.
 - **Conversation history management** - Automatically summarizes old messages when conversation gets long to maintain context.
 - **Customizable system prompt** - The assistant has a friendly, helpful personality.
 - **No internet required** - Everything runs locally with Docker and Ollama.
@@ -87,6 +87,9 @@ The application is configured via environment variables, which can be set in a `
 -   `CLI_OLLAMA_MODEL`: The Ollama model to use for the chat application.
 -   `CLI_MAX_RECENT`: The number of recent messages to keep in the conversation history before summarizing.
 -   `CLI_THRESHOLD`: The number of messages to keep in the conversation history before summarizing.
+-   `CLI_ENABLE_RAG`: Set to `true` to enable RAG integration in the CLI (requires running the RAG pipeline first).
+-   `CLI_RAG_MAX_DISTANCE`: The maximum distance score for a document to be considered relevant (lower is more relevant).
+-   `CLI_RAG_K`: The number of top relevant documents to retrieve for context.
 
 ## Development
 

@@ -1,7 +1,18 @@
 from ollama import Client
-from typing import Generator
+from typing import Generator, Optional
+from langchain_postgres import PGVector
+from enum import Enum
 
 from cli.config import settings
+from cli.rag import get_rag_context, build_rag_prompt
+from cli.services import ollama_client, pgvector_store
+
+
+class Role(Enum):
+    USER = "user"
+    ASSISTANT = "assistant"
+    SYSTEM = "system"
+
 
 # ANSI color codes
 GREEN = "\033[92m"
@@ -11,22 +22,24 @@ RESET = "\033[0m"
 
 
 class ChatApplication:
-    """Interactive chat application with Ollama."""
+    """Interactive chat application with Ollama and optional RAG support."""
 
     def __init__(
         self,
-        ollama_host: str = settings.ollama_base_url,
+        ollama_client: Client,
+        pgvector_store: Optional[PGVector],
         model: str = settings.cli_ollama_model,
         max_recent: int = settings.cli_max_recent,
         threshold: int = settings.cli_threshold,
     ):
-        """Initialize the chat application with Ollama client and configuration."""
-        self.client = Client(host=ollama_host)
+        """Initialize the chat application with required services and configuration."""
+        self.client = ollama_client
+        self.pgvector_store = pgvector_store
         self.model = model
-        self.ollama_host = ollama_host
         self.messages = []
         self.max_recent = max_recent
         self.threshold = threshold
+        self.rag_enabled = pgvector_store is not None
 
     def _summarize_messages(self, messages_to_summarize: list) -> dict | None:
         """Summarize a list of messages into a single message."""
@@ -50,12 +63,12 @@ class ChatApplication:
 
         response = self.client.chat(
             model=self.model,
-            messages=[{"role": "user", "content": summary_prompt}],
+            messages=[{"role": Role.USER.value, "content": summary_prompt}],
             stream=False,
         )
 
         return {
-            "role": "system",
+            "role": Role.SYSTEM.value,
             "content": f"[Earlier conversation summary]: {response['message']['content']}",
         }
 
@@ -84,23 +97,33 @@ class ChatApplication:
         for chunk in stream:
             yield chunk["message"]["content"]
 
-    def add_user_message(self, content: str) -> None:
-        """Add a user message to the conversation history."""
-        self.messages.append({"role": "user", "content": content})
+    def add_message(self, role: Role, content: str) -> None:
+        """Add a message to the conversation history."""
+        self.messages.append({"role": role.value, "content": content})
 
-    def add_assistant_message(self, content: str) -> None:
-        """Add an assistant message to the conversation history."""
-        self.messages.append({"role": "assistant", "content": content})
-
-    def chat(self, user_input: str) -> Generator[str, None, None]:
-        """Process user input and stream the assistant's response."""
-        self.add_user_message(user_input)
+    def _prepare_and_send(self, message_content: str) -> Generator[str, None, None]:
+        """Add a message to history, manage context, and send to the model."""
+        self.add_message(Role.USER, message_content)
         context_messages = self._manage_conversation_history()
         return self._send_message(context_messages)
 
+    def chat(self, user_input: str) -> Generator[str, None, None]:
+        """Process user input and stream the assistant's response."""
+        context = get_rag_context(user_input, self.pgvector_store)
+        if not context:
+            return self._prepare_and_send(user_input)
+
+        enriched_input = build_rag_prompt(user_input, context)
+        print(
+            f"{CYAN}(RAG: Retrieved context from {context.count('[Document')} documents){RESET}"
+        )
+        return self._prepare_and_send(enriched_input)
+
     def run(self) -> None:
         """Run the interactive chat loop."""
-        print(f"Chat Application (Connected to {self.ollama_host} using {self.model})")
+        print(f"Chat Application (Model: {self.model})")
+        if self.rag_enabled:
+            print(f"RAG enabled (Collection: '{settings.pg_collection_name}')")
         print("Type 'quit' or 'exit' to end the conversation.\n")
 
         while True:
@@ -121,7 +144,7 @@ class ChatApplication:
                     print(chunk, end="", flush=True)
 
                 # Add the complete assistant message to the history
-                self.add_assistant_message(assistant_message)
+                self.add_message(Role.ASSISTANT, assistant_message)
                 print("\n")
 
             except KeyboardInterrupt:
@@ -133,12 +156,15 @@ class ChatApplication:
 
 
 def main():
+    """Main entry point for the application."""
     try:
-        app = ChatApplication()
+        app = ChatApplication(
+            ollama_client=ollama_client,
+            pgvector_store=pgvector_store,
+        )
         app.run()
     except Exception as e:
-        print(f"Error: Failed to connect to Ollama at {settings.cli_ollama_host}")
-        print(f"Details: {e}")
+        print(f"Error: Failed to start the application. Details: {e}")
         exit(1)
 
 
