@@ -21,7 +21,7 @@ def _init_rag_store() -> Optional[PGVector]:
         ollama_embeddings = OllamaEmbeddings(
             base_url=settings.ollama_base_url, model=settings.rag_ollama_model
         )
-        engine = create_engine(settings.db_connection_string)
+        engine = create_engine(settings.db_url)
         pg_vector_store = PGVector(
             connection=engine,
             embeddings=ollama_embeddings,

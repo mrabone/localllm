@@ -28,8 +28,8 @@ class Settings(BaseSettings):
     )
 
     @property
-    def db_connection_string(self) -> str:
-        """Constructs the database connection string."""
+    def db_url(self) -> URL:
+        """Constructs the database connection URL object."""
         return URL.create(
             drivername="postgresql+psycopg2",
             username=self.pg_user,
@@ -37,7 +37,7 @@ class Settings(BaseSettings):
             host=self.pg_host,
             port=self.pg_port,
             database=self.pg_database,
-        ).render_as_string(hide_password=True)
+        )
 
     class Config:
         env_file = ".env"
