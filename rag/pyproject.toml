@@ -21,3 +21,8 @@ dependencies = [
 [tool.setuptools]
 package-dir = {"" = "src"}
 packages = ["rag"]
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.1.0",
+]
