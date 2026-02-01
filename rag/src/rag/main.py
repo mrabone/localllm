@@ -10,7 +10,7 @@ import asyncio
 import httpx
 from bs4 import BeautifulSoup
 from langchain_core.documents import Document
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_experimental.text_splitter import SemanticChunker
 from langchain_ollama import OllamaEmbeddings
 from langchain_postgres import PGVector
 
@@ -82,6 +82,7 @@ async def scrape_url(
 async def process_item(
     item: Dict[str, Any],
     pgvector_store: PGVector,
+    ollama_embeddings: OllamaEmbeddings,
     semaphore: asyncio.Semaphore,
     delay: float,
 ) -> None:
@@ -136,8 +137,10 @@ async def process_item(
 
         documents = [Document(page_content=cleaned_text, metadata={"source": url})]
 
-        text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000, chunk_overlap=200
+        text_splitter = SemanticChunker(
+            ollama_embeddings,
+            breakpoint_threshold_type="percentile",
+            breakpoint_threshold_amount=60,
         )
         texts = text_splitter.split_documents(documents)
         if not texts:
@@ -169,13 +172,20 @@ async def producer(queue: asyncio.Queue, reading_list: List[Dict[str, Any]]) -> 
 async def consumer(
     queue: asyncio.Queue,
     pgvector_store: PGVector,
+    ollama_embeddings: OllamaEmbeddings,
     semaphore: asyncio.Semaphore,
 ) -> None:
     """Consumes items from the queue and processes them."""
     while True:
         try:
             item = await queue.get()
-            await process_item(item, pgvector_store, semaphore, settings.request_delay)
+            await process_item(
+                item,
+                pgvector_store,
+                ollama_embeddings,
+                semaphore,
+                settings.request_delay,
+            )
             queue.task_done()
         except asyncio.CancelledError:
             break
@@ -224,7 +234,9 @@ async def run_pipeline(data_path: Path) -> None:
     # Create producer and consumer tasks
     producer_task = asyncio.create_task(producer(queue, reading_list))
     consumer_tasks = [
-        asyncio.create_task(consumer(queue, pgvector_store, semaphore))
+        asyncio.create_task(
+            consumer(queue, pgvector_store, ollama_embeddings, semaphore)
+        )
         for _ in range(settings.concurrent_requests)
     ]
 

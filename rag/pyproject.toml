@@ -7,7 +7,6 @@ dependencies = [
     "httpx",
     "langchain",
     "langchain-community",
-    "langchain-text-splitters",
     "ollama",
     "pydantic",
     "pydantic-settings",
@@ -16,8 +15,14 @@ dependencies = [
     "langchain-postgres",
     "sqlalchemy",
     "beautifulsoup4",
+    "langchain-experimental>=0.4.1",
 ]
 
 [tool.setuptools]
 package-dir = {"" = "src"}
 packages = ["rag"]
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.1.0",
+]
