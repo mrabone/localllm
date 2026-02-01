@@ -7,7 +7,6 @@ dependencies = [
     "httpx",
     "langchain",
     "langchain-community",
-    "langchain-text-splitters",
     "ollama",
     "pydantic",
     "pydantic-settings",
@@ -16,6 +15,7 @@ dependencies = [
     "langchain-postgres",
     "sqlalchemy",
     "beautifulsoup4",
+    "langchain-experimental>=0.4.1",
 ]
 
 [tool.setuptools]
