@@ -126,8 +126,18 @@ async def process_item(
     # 3. Load and split documents with Langchain
     try:
         soup = BeautifulSoup(html_content, "html.parser")
-        raw_text = soup.get_text()
-        cleaned_text = re.sub(r"\s+", " ", raw_text).strip()
+
+        # Find the best content block, falling back from <main> to <body> to the whole doc if none of the former are found
+        content_block = soup.main or soup.body or soup
+        text_content = content_block.get_text(separator="\n", strip=True)
+
+        # Collapse multiple spaces/tabs on the same line into a single space
+        cleaned_text = re.sub(r"[ \t]+", " ", text_content)
+        # Collapse three or more newlines into a standard paragraph break (two newlines)
+        cleaned_text = re.sub(r"\n{3,}", "\n\n", cleaned_text)
+
+        # Remove any leading/trailing whitespace from the whole text
+        cleaned_text = cleaned_text.strip()
 
         if not cleaned_text:
             logger.warning(
