@@ -10,7 +10,10 @@ run-cli:
 
 sync-deps:
 	@echo "Syncing workspace dependencies..."
-	uv sync
+	@$(foreach dir,$(PROJECTS_DIRS), \
+		echo "Installing dependencies for $$dir..."; \
+		(cd $(dir) && uv pip install -e .); \
+	)
 
 run-rag:
 	uv run rag/src/rag/main.py
