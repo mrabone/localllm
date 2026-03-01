@@ -322,7 +322,7 @@ class TestChatApplication:
         session_id = uuid.uuid4()
         sse_body = _make_sse_response(
             [
-                ("rag", "3"),
+                ("rag", '{"document_count": 3}'),
                 ("token", "Answer"),
                 ("done", "[DONE]"),
             ]

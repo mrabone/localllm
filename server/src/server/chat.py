@@ -114,15 +114,8 @@ class ChatSession:
         stream = self.client.chat(
             model=self.model, messages=context_messages, stream=True
         )
-        # The Ollama iterator uses an httpx streaming context internally.
-        # PEP 479 converts any StopIteration raised inside a generator into a
-        # RuntimeError, so we catch it explicitly to let the generator exit
-        # cleanly instead of propagating an error through run_in_executor.
-        try:
-            for chunk in stream:
-                yield chunk["message"]["content"]
-        except StopIteration:
-            return
+        for chunk in stream:
+            yield chunk["message"]["content"]
 
     # ------------------------------------------------------------------
     # Public entry point

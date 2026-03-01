@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import uuid
 from typing import AsyncGenerator
@@ -84,8 +85,7 @@ def chat(
                      retrieved context).
       - ``done``   — signals the end of the stream (data: "[DONE]").
       - ``error``  — sent if an exception occurs mid-stream.
-    """
-    if not session_exists(engine, session_id):
+    """    if not session_exists(engine, session_id):
         raise HTTPException(status_code=404, detail="Session not found.")
 
     session = ChatSession(
@@ -102,18 +102,15 @@ def chat(
         if rag_result is not None:
             yield {
                 "event": "rag",
-                "data": str(rag_result.document_count),
+                "data": json.dumps({"document_count": rag_result.document_count}),
             }
 
         try:
             # The synchronous Ollama generator uses httpx streaming internally.
-            # Calling next() on it across an await boundary causes PEP 479 to
-            # convert StopIteration into RuntimeError("generator raised
-            # StopIteration"). To avoid this entirely, we run the generator in
-            # a thread and feed tokens into an asyncio.Queue. The async side
-            # only ever awaits queue.get(), so no StopIteration ever crosses
-            # the async boundary.
-            loop = asyncio.get_event_loop()
+            # We run it in a thread and feed tokens into an asyncio.Queue so
+            # the async side only ever awaits queue.get(), keeping the sync
+            # and async worlds cleanly separated.
+            loop = asyncio.get_running_loop()
             queue: asyncio.Queue = asyncio.Queue()
             _done = object()
 

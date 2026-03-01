@@ -1,4 +1,5 @@
 import argparse
+import json
 import sys
 
 import httpx
@@ -57,12 +58,16 @@ class ChatApplication:
                 if line.startswith("event:"):
                     current_event = line[len("event:") :].strip()
                 elif line.startswith("data:"):
-                    data = line[len("data: ") :]
+                    # Strip exactly one optional separator space after "data:"
+                    # so that "data: foo" and "data:foo" both yield "foo",
+                    # while "data:  two spaces" yields " two spaces".
+                    raw = line[len("data:") :]
+                    data = raw[1:] if raw.startswith(" ") else raw
 
                     if current_event == "token":
                         print(data, end="", flush=True)
                     elif current_event == "rag":
-                        rag_doc_count = int(data)
+                        rag_doc_count = json.loads(data)["document_count"]
                     elif current_event == "error":
                         print(f"\nServer error: {data}")
                         break

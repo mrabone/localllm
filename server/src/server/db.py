@@ -10,7 +10,6 @@ from sqlalchemy import (
     Table,
     Text,
     func,
-    text,
 )
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.engine import Engine
@@ -25,7 +24,6 @@ sessions_table = Table(
         UUID(as_uuid=True),
         primary_key=True,
         default=uuid.uuid4,
-        server_default=text("gen_random_uuid()"),
     ),
     Column("created_at", DateTime(timezone=True), server_default=func.now()),
 )

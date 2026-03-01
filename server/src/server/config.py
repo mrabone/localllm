@@ -50,7 +50,7 @@ class Settings(SharedSettings):
     server_rag_max_distance: float = Field(
         default=0.5,
         alias="SERVER_RAG_MAX_DISTANCE",
-        description="Maximum L2 distance for a retrieved document to be included in context.",
+        description="Maximum cosine distance for a retrieved document to be included in context.",
     )
 
 
