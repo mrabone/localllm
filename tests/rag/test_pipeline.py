@@ -1,51 +1,39 @@
 import json
-import tempfile
 from pathlib import Path
 
 from rag.main import extract_text_from_html, load_reading_list
 
 
 class TestLoadReadingList:
-    def test_returns_empty_list_for_missing_file(self):
-        result = load_reading_list(Path("/non/existent/path.json"))
+    def test_returns_empty_list_for_missing_file(self, tmp_path):
+        missing_file = tmp_path / "missing.json"
+        result = load_reading_list(missing_file)
         assert result == []
 
-    def test_returns_empty_list_for_invalid_json(self):
-        with tempfile.NamedTemporaryFile(
-            suffix=".json", mode="w", delete=False, encoding="utf-8"
-        ) as f:
-            f.write("not valid json {{{")
-            path = Path(f.name)
+    def test_returns_empty_list_for_invalid_json(self, tmp_path):
+        json_file = tmp_path / "invalid.json"
+        json_file.write_text("not valid json {{{", encoding="utf-8")
 
-        result = load_reading_list(path)
+        result = load_reading_list(json_file)
         assert result == []
-        path.unlink()
 
-    def test_returns_parsed_list_for_valid_json(self):
+    def test_returns_parsed_list_for_valid_json(self, tmp_path):
         data = [
             {"title": "Article One", "url": "http://example.com/1"},
             {"title": "Article Two", "url": "http://example.com/2"},
         ]
-        with tempfile.NamedTemporaryFile(
-            suffix=".json", mode="w", delete=False, encoding="utf-8"
-        ) as f:
-            json.dump(data, f)
-            path = Path(f.name)
+        json_file = tmp_path / "valid.json"
+        json_file.write_text(json.dumps(data), encoding="utf-8")
 
-        result = load_reading_list(path)
+        result = load_reading_list(json_file)
         assert result == data
-        path.unlink()
 
-    def test_returns_empty_list_for_empty_array(self):
-        with tempfile.NamedTemporaryFile(
-            suffix=".json", mode="w", delete=False, encoding="utf-8"
-        ) as f:
-            json.dump([], f)
-            path = Path(f.name)
+    def test_returns_empty_list_for_empty_array(self, tmp_path):
+        json_file = tmp_path / "empty.json"
+        json_file.write_text(json.dumps([]), encoding="utf-8")
 
-        result = load_reading_list(path)
+        result = load_reading_list(json_file)
         assert result == []
-        path.unlink()
 
 
 class TestExtractTextFromHtml:

@@ -1,4 +1,4 @@
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 from cli.rag import RagResult, build_rag_prompt, get_rag_context
 

@@ -37,9 +37,7 @@ def get_rag_store() -> Optional[PGVector]:
             embeddings=embeddings,
             collection_name=settings.pg_collection_name,
         )
-        logger.info(
-            "Connected to PGVector collection '%s'", settings.pg_collection_name
-        )
+        print(f"Connected to PGVector collection '{settings.pg_collection_name}'")
         return store
     except Exception as e:
         logger.warning("Failed to initialise RAG store: %s", e)

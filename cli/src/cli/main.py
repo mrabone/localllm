@@ -45,9 +45,11 @@ class ChatApplication:
         """
         self.client = ollama_client
         self.pgvector_store = pgvector_store
-        self.model = model or settings.cli_ollama_model
-        self.max_recent = max_recent or settings.cli_max_recent
-        self.threshold = threshold or settings.cli_threshold
+        self.model = model if model is not None else settings.cli_ollama_model
+        self.max_recent = (
+            max_recent if max_recent is not None else settings.cli_max_recent
+        )
+        self.threshold = threshold if threshold is not None else settings.cli_threshold
         self.rag_enabled = pgvector_store is not None
         self.messages: list[dict[str, str]] = []
 
@@ -77,9 +79,13 @@ class ChatApplication:
             stream=False,
         )
 
+        content = response.get("message", {}).get("content", "").strip()
+        if not content:
+            return None
+
         return {
             "role": Role.SYSTEM.value,
-            "content": f"[Earlier conversation summary]: {response['message']['content']}",
+            "content": f"[Earlier conversation summary]: {content}",
         }
 
     def _manage_conversation_history(self) -> list[dict[str, str]]:

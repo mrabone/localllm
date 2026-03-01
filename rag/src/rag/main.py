@@ -39,7 +39,7 @@ def load_reading_list(file_path: Path) -> list[dict]:
         file_path: Path to the JSON file.
 
     Returns:
-        A list of item dicts, or an empty list if the file is missing or invalid.
+        A list of item dicts, or an empty list if the file is missing, unreadable, or invalid.
     """
     if not file_path.exists():
         logger.error("File not found: %s", file_path)
@@ -47,10 +47,22 @@ def load_reading_list(file_path: Path) -> list[dict]:
 
     try:
         with open(file_path, encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
     except json.JSONDecodeError as e:
         logger.error("Failed to decode JSON from %s: %s", file_path, e)
         return []
+    except (OSError, IOError) as e:
+        logger.error("Failed to read file %s: %s", file_path, e)
+        return []
+
+    # Validate that the parsed JSON is a list of dict-like items
+    if not isinstance(data, list):
+        logger.error(
+            "Expected JSON array in %s, but got %s", file_path, type(data).__name__
+        )
+        return []
+
+    return data
 
 
 async def scrape_url(
