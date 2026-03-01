@@ -2,11 +2,22 @@
 
 Personal project where I experiment with LLMs locally.
 
+## Architecture
+
+The project is split into four packages in a `uv` workspace:
+
+- **`server/`** — FastAPI HTTP server. Owns all chat logic: session management, conversation history (PostgreSQL), RAG retrieval (pgvector), summarisation, and streaming responses via SSE. Runs in Docker.
+- **`cli/`** — Thin terminal REPL. Sends user input to the server and renders the streamed response. Named sessions are stored in a local JSON registry at `~/.localllm_sessions.json`.
+- **`rag/`** — One-shot pipeline that scrapes websites and ingests content into the pgvector store.
+- **`common/`** — Shared utilities used by `server` and `rag`.
+
 ## Features
 
 - **Interactive CLI chat interface** - Have conversations with a local LLM in your terminal, optionally enriched with your own data via RAG.
+- **Named sessions** - Save and resume conversations by name with `--session <name>`. Each run without a name starts a fresh session.
 - **Knowledge Base Integration** - Automatically import content from websites to let the assistant answer questions based on your custom data sources.
-- **Conversation history management** - Automatically summarizes old messages when conversation gets long to maintain context.
+- **Conversation history management** - Automatically summarizes old messages when the conversation gets long to maintain context.
+- **Persistent sessions** - Conversation history is stored in PostgreSQL and survives CLI restarts.
 - **Customizable system prompt** - The assistant has a friendly, helpful personality.
 - **No internet required** - Everything runs locally with Docker and Ollama.
 - **Flexible model selection** - Easy to switch between different Ollama models.
@@ -19,113 +30,164 @@ Personal project where I experiment with LLMs locally.
 - Python 3.11+
 - `uv` (recommended for dependency management)
 
-### Running Locally with Docker
+### Running Locally
 
-1.  **Configure Environment Variables:**
-    
-      Create a `.env` file from the example template:
+1. **Configure environment variables** — copy the example template and edit as needed:
+   ```bash
+   cp .env.example .env
+   ```
 
-      ```bash
-      cp .env.example .env
-      ```
-      
-      You can then modify your `.env` file to change the default settings where necessary.
+2. **Start all Docker services** (Ollama, PostgreSQL, and the server):
+   ```bash
+   make setup
+   ```
+   On first run, Ollama will pull the embedding model and build the custom chat model from `Modelfile`. This can take a few minutes.
 
-2.  **Start Docker Services:**
-    ```bash
-    make setup
-    ```
-    This will start the Ollama and PostgreSQL containers.
+3. **Install local dependencies:**
+   ```bash
+   make sync-deps
+   ```
 
-3.  **Install Dependencies:**
-    ```bash
-    make sync-deps
-    ```
+4. *(Optional)* **Run the RAG pipeline** to populate the knowledge base:
+   ```bash
+   make run-rag
+   ```
 
-4.  **Run the RAG Pipeline:**
-         
-      To populate the vector database with the content from the test data file (`rag/src/rag/data/reading_list_test_data.json`):
+5. **Start chatting:**
+   ```bash
+   make run-cli
+   ```
+   The CLI connects to the server running in Docker and streams responses to your terminal.
 
-      ```bash
-      make run-rag
-      ```
+   On first run (anonymous session), the application will print instructions for saving and resuming sessions.
 
-5.  **Run the CLI Chat Application:**
-    ```bash
-    make run-cli
-    ```
-    The CLI will connect to the local Ollama instance and you can start chatting!
+   To resume or create a named session:
+   ```bash
+   make run-cli SESSION_ARGS='--session work'
+   ```
+   Replace `work` with any session name. The first run with a new name creates a new session; subsequent runs resume it.
 
 ### Stopping the Services
 
 ```bash
-docker-compose down
+make down
 ```
+
+## Using Named Sessions
+
+Sessions are automatically persisted and can be resumed across CLI runs. Each session maintains its own conversation history in PostgreSQL.
+
+**Anonymous sessions (no `--session` flag):**
+- Create a fresh session each time you run the CLI
+- Conversation history is stored but not easily accessible
+- You'll be prompted with instructions on how to save it if needed
+
+**Named sessions (with `--session <name>`):**
+- Save and resume conversations by name
+- First run with a new name creates the session
+- Subsequent runs resume the same conversation
+- Session list is printed when you start an anonymous session
+
+**Examples:**
+```bash
+# Start a fresh session
+make run-cli
+
+# Create and use a "work" session
+make run-cli SESSION_ARGS='--session work'
+
+# Resume the "work" session later
+make run-cli SESSION_ARGS='--session work'
+
+# Create a "project-x" session
+make run-cli SESSION_ARGS='--session project-x'
+```
+
+All sessions are stored in `~/.localllm_sessions.json` and cached for fast startup (default: 300 seconds). See `cli/README.md` for detailed documentation on session management, caching, and performance.
+
+### Stopping the Services
+
+```bash
+make down
+```
+
+## Make Targets
+
+| Target | Description |
+|--------|-------------|
+| `make setup` | Bring all Docker services up in the background (detached) |
+| `make down` | Stop and remove all Docker containers |
+| `make sync-deps` | Install / sync all workspace dependencies via `uv sync` |
+| `make run-cli [SESSION_ARGS='--session <name>']` | Start the interactive CLI chat REPL. Optionally pass `SESSION_ARGS` to load or create a named session. |
+| `make run-rag` | Run the RAG ingestion pipeline |
+| `make test` | Run the full test suite with pytest |
 
 ## Configuration
 
-The application is configured via environment variables, which can be set in a `.env` file in the project root. An `.env.example` file is provided as a template.
+Configured via environment variables in a `.env` file. Copy `.env.example` to get started.
 
 ### Common
 
--   `OLLAMA_BASE_URL`: The base URL for the Ollama API.
+- `OLLAMA_BASE_URL` — Base URL for the Ollama API (default: `http://127.0.0.1:11434`).
+
+### PostgreSQL
+
+- `PG_HOST`, `PG_PORT`, `PG_DATABASE`, `PG_USER`, `PG_PASSWORD` — database connection details.
+- `PG_COLLECTION_NAME` — table name for pgvector embeddings (used by RAG pipeline).
 
 ### RAG Pipeline
 
--   `PG_HOST`: The hostname of the PostgreSQL database.
--   `PG_PORT`: The port of the PostgreSQL database.
--   `PG_DATABASE`: The name of the database to use.
--   `PG_USER`: The username for the database.
--   `PG_PASSWORD`: The password for the database.
--   `PG_COLLECTION_NAME`: The name of the collection (table) to store the embeddings in.
--   `RAG_OLLAMA_MODEL`: The Ollama model to use for generating embeddings.
--   `CONCURRENT_REQUESTS`: The number of concurrent requests to make when scraping websites.
--   `REQUEST_DELAY`: The delay in seconds between requests.
+- `RAG_OLLAMA_MODEL` — Ollama model used to generate embeddings.
+- `CONCURRENT_REQUESTS` — number of concurrent requests when scraping websites.
+- `REQUEST_DELAY` — delay in seconds between scrape requests.
 
-### CLI Application
+### Server
 
--   `CLI_OLLAMA_MODEL`: The Ollama model to use for the chat application.
--   `CLI_MAX_RECENT`: The number of recent messages to keep in the conversation history before summarizing.
--   `CLI_THRESHOLD`: The number of messages to keep in the conversation history before summarizing.
--   `CLI_ENABLE_RAG`: Set to `true` to enable RAG integration in the CLI (requires running the RAG pipeline first).
--   `CLI_RAG_MAX_DISTANCE`: The maximum distance score for a document to be considered relevant (lower is more relevant).
--   `CLI_RAG_K`: The number of top relevant documents to retrieve for context.
+- `SERVER_OLLAMA_MODEL` — Ollama model used for chat responses.
+- `SERVER_MAX_RECENT` — number of recent messages to retain before summarising.
+- `SERVER_THRESHOLD` — total message count that triggers summarisation.
+- `SERVER_ENABLE_RAG` — set to `true` to enable RAG context injection (requires the RAG pipeline to have been run first).
+- `SERVER_RAG_MAX_DISTANCE` — maximum similarity distance for a document to be considered relevant.
+- `SERVER_RAG_K` — number of top documents to retrieve per query.
+- `SERVER_HOST` / `SERVER_PORT` — host and port the server binds to inside Docker.
+
+### CLI
+
+- `SERVER_URL` — base URL of the localLLM server (default: `http://127.0.0.1:8000`).
+- `SESSIONS_REGISTRY` — path to the JSON file that maps session names to UUIDs (default: `~/.localllm_sessions.json`).
+- `SESSION_CACHE_TTL` — seconds a validated session UUID is trusted locally before re-checking with the server (default: `300`). Set to `0` to always validate on startup.
 
 ## Development
 
 ### Dependency Management
 
-The project is organized as a workspace with multiple members (`cli`, `rag`). Dependencies are defined in the `pyproject.toml` file for each project.
+The project is a `uv` workspace with four members: `cli`, `common`, `rag`, and `server`. To install all dependencies into the shared virtual environment:
 
-To install these dependencies, run:
 ```bash
 make sync-deps
 ```
 
+### Running Tests
+
+```bash
+make test
+```
+
 ### Changing the Model
 
-1.  **Find available models** on [Ollama's model library](https://ollama.com/library).
+1. Find available models on [Ollama's model library](https://ollama.com/library).
 
-2.  **Pull the model into your container:**
-    ```bash
-    docker compose exec ollama ollama pull <model-name>
-    ```
-    For example:
-    ```bash
-    docker compose exec ollama ollama pull llama2
-    docker compose exec ollama ollama pull mistral
-    ```
+2. Pull the model into the running container:
+   ```bash
+   docker compose exec ollama ollama pull <model-name>
+   ```
 
-3.  **Update your `.env` file:**
+3. Update `SERVER_OLLAMA_MODEL` in your `.env` file:
+   ```
+   SERVER_OLLAMA_MODEL=<model-name>
+   ```
 
-      Change the `CLI_OLLAMA_MODEL` or `RAG_OLLAMA_MODEL` variables to the new model name in the `.env` file like so:
-
-      ```
-      CLI_OLLAMA_MODEL=<model-name>
-      ```
-
-4.  **Run the application:**
-    ```bash
-    make run-cli
-    ```
-
+4. Restart the server container to pick up the change:
+   ```bash
+   docker compose restart server
+   ```
