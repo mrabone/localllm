@@ -1,180 +1,220 @@
-from sqlalchemy import create_engine
-import re
 import argparse
+import asyncio
 import json
 import logging
+import re
 from pathlib import Path
-from typing import List, Dict, Any, Optional
 
-import asyncio
 import httpx
 from bs4 import BeautifulSoup
 from langchain_core.documents import Document
 from langchain_experimental.text_splitter import SemanticChunker
 from langchain_ollama import OllamaEmbeddings
 from langchain_postgres import PGVector
+from sqlalchemy import create_engine
 
 from rag.config import settings
-from rag.logging_utils import LoggingSetup
+from common.logging_utils import setup_logging
 
+logger = logging.getLogger(__name__)
 
+# HTTP headers used for all scraping requests.
+# A realistic browser UA reduces the chance of being blocked by simple filters.
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/91.0.4472.124 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
     "Referer": "https://www.google.com/",
 }
 
 
-LoggingSetup.setup_logging()
-logger = logging.getLogger(__name__)
-
-
-def load_reading_list(file_path: Path) -> List[Dict[str, Any]]:
-    """
-    Loads the reading list from a JSON file.
+def load_reading_list(file_path: Path) -> list[dict]:
+    """Load the reading list from a JSON file.
 
     Args:
         file_path: Path to the JSON file.
 
     Returns:
-        A list of dictionaries representing the reading list.
-        Returns an empty list if the file is not found or invalid.
+        A list of item dicts, or an empty list if the file is missing, unreadable, or invalid.
     """
     if not file_path.exists():
-        logger.error(f"File not found at {file_path}")
+        logger.error("File not found: %s", file_path)
         return []
 
     try:
-        with open(file_path, "r", encoding="utf-8") as f:
-            return json.load(f)
+        with open(file_path, encoding="utf-8") as f:
+            data = json.load(f)
     except json.JSONDecodeError as e:
-        logger.error(f"Failed to decode JSON from {file_path}: {e}")
+        logger.error("Failed to decode JSON from %s: %s", file_path, e)
         return []
+    except (OSError, IOError) as e:
+        logger.error("Failed to read file %s: %s", file_path, e)
+        return []
+
+    # Validate that the parsed JSON is a list of dict-like items
+    if not isinstance(data, list):
+        logger.error(
+            "Expected JSON array in %s, but got %s", file_path, type(data).__name__
+        )
+        return []
+
+    return data
 
 
 async def scrape_url(
-    url: str, semaphore: asyncio.Semaphore, delay: float
-) -> Optional[str]:
-    """
-    Fetches HTML content from a single URL with rate limiting.
+    url: str,
+    semaphore: asyncio.Semaphore,
+    delay: float,
+) -> str | None:
+    """Fetch raw HTML from a URL, respecting the concurrency semaphore and delay.
+
+    Args:
+        url: The URL to fetch.
+        semaphore: Limits the number of concurrent requests.
+        delay: Seconds to wait before issuing the request (per worker).
+
+    Returns:
+        The response body as a string, or None on any error.
     """
     async with semaphore:
-        await asyncio.sleep(delay)  # Apply delay before request
+        await asyncio.sleep(delay)
         try:
-            logger.info(f"Attempting to fetch URL: {url}")
+            logger.info("Fetching: %s", url)
             async with httpx.AsyncClient(timeout=30.0) as client:
                 response = await client.get(url, headers=HEADERS)
-                response.raise_for_status()  # Raise an exception for 4xx/5xx responses
-                logger.info(f"Successfully fetched URL: {url}")
+                response.raise_for_status()
+                logger.info("Fetched successfully: %s", url)
                 return response.text
         except httpx.RequestError as e:
-            logger.error(f"HTTPX Request error fetching {url}: {e}")
-            return None
+            logger.error("Request error fetching %s: %s", url, e)
         except httpx.HTTPStatusError as e:
-            logger.error(f"HTTP Status error fetching {url}: {e}")
-            return None
+            logger.error("HTTP status error fetching %s: %s", url, e)
         except Exception as e:
-            logger.error(f"An unexpected error occurred while fetching {url}: {e}")
-            return None
+            logger.error("Unexpected error fetching %s: %s", url, e)
+        return None
+
+
+def extract_text_from_html(html: str) -> str | None:
+    """Parse HTML and return cleaned plain text, or None if no text was found.
+
+    Falls back from <main> → <body> → the whole document when selecting the
+    primary content block. Collapses whitespace and normalises newlines.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    content_block = soup.main or soup.body or soup
+    raw_text = content_block.get_text(separator="\n", strip=True)
+
+    # Collapse runs of spaces/tabs into a single space
+    cleaned = re.sub(r"[ \t]+", " ", raw_text)
+    # Normalise 3+ consecutive newlines into a standard paragraph break
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    cleaned = cleaned.strip()
+
+    return cleaned if cleaned else None
+
+
+def chunk_documents(
+    text: str,
+    url: str,
+    embeddings: OllamaEmbeddings,
+) -> list[Document]:
+    """Split text into semantic chunks using the configured SemanticChunker.
+
+    Args:
+        text: The cleaned plain text to split.
+        url: The source URL, stored in each chunk's metadata.
+        embeddings: The embeddings model used to determine split points.
+
+    Returns:
+        A list of Document chunks, or an empty list if splitting produced nothing.
+    """
+    document = Document(page_content=text, metadata={"source": url})
+    splitter = SemanticChunker(
+        embeddings,
+        breakpoint_threshold_type=settings.chunker_breakpoint_type,
+        breakpoint_threshold_amount=settings.chunker_breakpoint_amount,
+    )
+    return splitter.split_documents([document])
 
 
 async def process_item(
-    item: Dict[str, Any],
+    item: dict,
     pgvector_store: PGVector,
-    ollama_embeddings: OllamaEmbeddings,
+    embeddings: OllamaEmbeddings,
     semaphore: asyncio.Semaphore,
     delay: float,
 ) -> None:
+    """Process a single reading-list item end-to-end.
+
+    Steps: validate → duplicate-check → scrape → extract text →
+    chunk → embed → store.
+
+    Args:
+        item: A reading-list dict with 'url' and optional 'title' keys.
+        pgvector_store: Destination vector store.
+        embeddings: Embeddings model for chunking and storage.
+        semaphore: Concurrency limiter passed through to the scraper.
+        delay: Per-request delay in seconds passed through to the scraper.
     """
-    Processes a single item from the reading list: scrapes HTML, extracts content,
-    generates embeddings, and stores in PgVector.
-    """
-    title = item.get("title")
-    url = item.get("url")
+    url: str | None = item.get("url")
+    title: str = item.get("title") or url or "Unknown Item"
 
     if not url:
-        logger.warning(
-            f"Skipping item with missing URL: {title if title else 'Unknown Item'}"
-        )
+        logger.warning("Skipping item with missing URL: %s", title)
         return
 
-    if not title:
-        title = url  # Use URL as title if title is missing
-        logger.info(f"Title missing for item, using URL as title: {title}")
+    logger.info("Processing: %s (%s)", title, url)
 
-    logger.info(f"Processing: {title} ({url})")
-
-    # 1. Check if URL has already been processed
+    # 1. Skip already-processed URLs
     try:
-        existing_docs = pgvector_store.similarity_search(
-            query=" ", filter={"source": url}
-        )
-        if existing_docs:
-            logger.info(f"URL {url} has already been processed. Skipping.")
+        if pgvector_store.similarity_search(query=" ", filter={"source": url}):
+            logger.info("Already processed, skipping: %s", url)
             return
     except Exception as e:
-        logger.error(f"Error checking for existing documents for {url}: {e}")
-        pass
+        logger.error("Error checking for existing documents for %s: %s", url, e)
 
-    # 2. Scrape HTML content
-    html_content = await scrape_url(url, semaphore, delay)
-    if not html_content:
-        logger.error(f"Failed to get HTML content for {url}. Skipping processing.")
+    # 2. Scrape
+    html = await scrape_url(url, semaphore, delay)
+    if not html:
+        logger.error("Failed to fetch HTML for %s — skipping.", url)
         return
 
-    # 3. Load and split documents with Langchain
-    try:
-        soup = BeautifulSoup(html_content, "html.parser")
-
-        # Find the best content block, falling back from <main> to <body> to the whole doc if none of the former are found
-        content_block = soup.main or soup.body or soup
-        text_content = content_block.get_text(separator="\n", strip=True)
-
-        # Collapse multiple spaces/tabs on the same line into a single space
-        cleaned_text = re.sub(r"[ \t]+", " ", text_content)
-        # Collapse three or more newlines into a standard paragraph break (two newlines)
-        cleaned_text = re.sub(r"\n{3,}", "\n\n", cleaned_text)
-
-        # Remove any leading/trailing whitespace from the whole text
-        cleaned_text = cleaned_text.strip()
-
-        if not cleaned_text:
-            logger.warning(
-                f"No meaningful text extracted from {url}. Skipping embeddings."
-            )
-            return
-
-        documents = [Document(page_content=cleaned_text, metadata={"source": url})]
-
-        text_splitter = SemanticChunker(
-            ollama_embeddings,
-            breakpoint_threshold_type="percentile",
-            breakpoint_threshold_amount=60,
-        )
-        texts = text_splitter.split_documents(documents)
-        if not texts:
-            logger.warning(f"No text chunks to add for {url}. Skipping.")
-            return
-        logger.info(
-            f"Split {len(documents)} documents from {url} into {len(texts)} chunks."
-        )
-    except Exception as e:
-        logger.error(f"Error loading or splitting documents for {url}: {e}")
+    # 3. Extract text
+    text = extract_text_from_html(html)
+    if not text:
+        logger.warning("No meaningful text extracted from %s — skipping.", url)
         return
 
-    # 4. Generate embeddings and store in PgVector
+    # 4. Chunk
     try:
-        # Add documents to PgVector
-        # PGVector automatically creates embeddings if an embeddings object is provided
-        pgvector_store.add_documents(texts)
-        logger.info(f"Successfully added {len(texts)} chunks from {url} to PgVector.")
+        chunks = chunk_documents(text, url, embeddings)
     except Exception as e:
-        logger.error(f"Error adding documents to PgVector for {url}: {e}")
+        logger.error("Error chunking %s: %s", url, e)
+        return
+
+    if not chunks:
+        logger.warning("No chunks produced for %s — skipping.", url)
+        return
+
+    logger.info("Split into %d chunk(s): %s", len(chunks), url)
+
+    # 5. Store
+    try:
+        pgvector_store.add_documents(chunks)
+        logger.info("Stored %d chunk(s) from %s.", len(chunks), url)
+    except Exception as e:
+        logger.error("Error storing chunks for %s: %s", url, e)
 
 
-async def producer(queue: asyncio.Queue, reading_list: List[Dict[str, Any]]) -> None:
-    """Puts items from the reading list into the queue."""
+async def producer(
+    queue: asyncio.Queue,
+    reading_list: list[dict],
+) -> None:
+    """Enqueue all reading-list items for the consumers to process."""
     for item in reading_list:
         await queue.put(item)
 
@@ -182,17 +222,21 @@ async def producer(queue: asyncio.Queue, reading_list: List[Dict[str, Any]]) -> 
 async def consumer(
     queue: asyncio.Queue,
     pgvector_store: PGVector,
-    ollama_embeddings: OllamaEmbeddings,
+    embeddings: OllamaEmbeddings,
     semaphore: asyncio.Semaphore,
 ) -> None:
-    """Consumes items from the queue and processes them."""
+    """Consume items from the queue until cancelled.
+
+    Unexpected errors are logged and the current item is skipped so that
+    the worker remains alive for subsequent items.
+    """
     while True:
         try:
             item = await queue.get()
             await process_item(
                 item,
                 pgvector_store,
-                ollama_embeddings,
+                embeddings,
                 semaphore,
                 settings.request_delay,
             )
@@ -200,91 +244,91 @@ async def consumer(
         except asyncio.CancelledError:
             break
         except Exception:
-            logger.exception("Error in consumer")
-            break
+            logger.exception("Unexpected error processing item — skipping.")
+            queue.task_done()
+
+
+def init_pgvector_store(embeddings: OllamaEmbeddings) -> PGVector:
+    """Connect to PostgreSQL and return an initialised PGVector store.
+
+    Raises on failure so that the caller can decide whether to abort the pipeline.
+    """
+    engine = create_engine(settings.db_url)
+    return PGVector(
+        connection=engine,
+        embeddings=embeddings,
+        collection_name=settings.pg_collection_name,
+    )
 
 
 async def run_pipeline(data_path: Path) -> None:
+    """Load a reading list and process all items concurrently.
+
+    Args:
+        data_path: Path to the JSON file containing the reading list.
     """
-    Orchestrates the loading and processing of the reading list concurrently.
-    """
-    logger.info(f"Loading reading list from: {data_path}")
+    logger.info("Loading reading list from: %s", data_path)
     reading_list = load_reading_list(data_path)
 
     if not reading_list:
         logger.info("No items to process.")
         return
 
-    logger.info(f"Successfully loaded {len(reading_list)} items.")
+    logger.info("Loaded %d item(s).", len(reading_list))
 
-    logger.info("Initializing OllamaEmbeddings...")
-    ollama_embeddings = OllamaEmbeddings(
-        base_url=settings.ollama_base_url, model=settings.rag_ollama_model
+    logger.info("Initialising embeddings model...")
+    embeddings = OllamaEmbeddings(
+        base_url=settings.ollama_base_url,
+        model=settings.rag_ollama_model,
     )
-    logger.info("OllamaEmbeddings initialized.")
+    logger.info("Embeddings model ready.")
 
-    CONNECTION_STRING = f"postgresql+psycopg2://{settings.pg_user}:{settings.pg_password}@{settings.pg_host}:{settings.pg_port}/{settings.pg_database}"
     try:
-        logger.info("Connecting to PgVector store...")
-        engine = create_engine(CONNECTION_STRING)
-        pgvector_store = PGVector(
-            connection=engine,
-            embeddings=ollama_embeddings,
-            collection_name=settings.pg_collection_name,
-        )
-        logger.info("Successfully connected to PgVector store.")
+        logger.info("Connecting to PGVector store...")
+        pgvector_store = init_pgvector_store(embeddings)
+        logger.info("PGVector store ready.")
     except Exception as e:
-        logger.error(f"Failed to connect to PgVector store: {e}")
+        logger.error("Failed to connect to PGVector store: %s", e)
         return
 
-    # Create a semaphore and a queue
     semaphore = asyncio.Semaphore(settings.concurrent_requests)
-    queue = asyncio.Queue()
+    queue: asyncio.Queue = asyncio.Queue()
 
-    # Create producer and consumer tasks
     producer_task = asyncio.create_task(producer(queue, reading_list))
     consumer_tasks = [
-        asyncio.create_task(
-            consumer(queue, pgvector_store, ollama_embeddings, semaphore)
-        )
+        asyncio.create_task(consumer(queue, pgvector_store, embeddings, semaphore))
         for _ in range(settings.concurrent_requests)
     ]
 
-    # Wait for the producer to finish
     await producer_task
-
-    # Wait for all items in the queue to be processed
     await queue.join()
 
-    # Cancel the consumer tasks
     for task in consumer_tasks:
         task.cancel()
-
-    # Wait for the consumer tasks to finish cancelling
     await asyncio.gather(*consumer_tasks, return_exceptions=True)
 
-    logger.info("Pipeline processing complete.")
+    logger.info("Pipeline complete.")
 
 
-def main():
+def main() -> None:
+    """Parse CLI arguments and run the RAG ingestion pipeline."""
+    setup_logging()
+
     parser = argparse.ArgumentParser(
         description="Process a reading list from a JSON file."
     )
     parser.add_argument(
         "--data_file",
         type=str,
-        help="Path to the JSON data file containing the reading list.",
         default=None,
+        help="Path to the JSON data file. Defaults to the bundled test data.",
     )
     args = parser.parse_args()
-
-    base_dir = Path(__file__).parent
 
     if args.data_file:
         data_file_path = Path(args.data_file)
     else:
-        # Default to the test data file if no argument is provided
-        data_file_path = base_dir / "data" / "reading_list_test_data.json"
+        data_file_path = Path(__file__).parent / "data" / "reading_list_test_data.json"
 
     asyncio.run(run_pipeline(data_file_path))
 

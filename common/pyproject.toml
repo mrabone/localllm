@@ -1,0 +1,14 @@
+[project]
+name = "common"
+version = "0.1.0"
+description = "Shared configuration and utilities for the localllm workspace"
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2.0",
+    "pydantic-settings>=2.0",
+    "sqlalchemy",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+packages = ["common"]

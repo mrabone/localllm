@@ -1,48 +1,53 @@
-from pydantic_settings import BaseSettings
 from pydantic import Field
-from sqlalchemy.engine import URL
+from pydantic_settings import SettingsConfigDict
+
+from common.config import SharedSettings
 
 
-class Settings(BaseSettings):
-    ollama_base_url: str = Field(
-        default="http://127.0.0.1:11434", alias="OLLAMA_BASE_URL"
+class Settings(SharedSettings):
+    """Settings for the CLI chat application.
+
+    Inherits all shared PostgreSQL and Ollama fields from SharedSettings.
+    CLI-specific settings control the chat model, conversation history
+    management, and RAG retrieval behaviour.
+    """
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
     )
+
+    # Chat model
     cli_ollama_model: str = Field(
-        default="custom-chatbot-model", alias="CLI_OLLAMA_MODEL"
+        default="custom-chatbot-model",
+        alias="CLI_OLLAMA_MODEL",
     )
-    cli_max_recent: int = Field(default=10, alias="CLI_MAX_RECENT")
-    cli_threshold: int = Field(default=20, alias="CLI_THRESHOLD")
+
+    # Conversation history management
+    cli_max_recent: int = Field(
+        default=10,
+        alias="CLI_MAX_RECENT",
+        description="Number of recent messages to retain verbatim before summarisation.",
+    )
+    cli_threshold: int = Field(
+        default=20,
+        alias="CLI_THRESHOLD",
+        description="Total message count at which history summarisation is triggered.",
+    )
+
+    # RAG retrieval
     cli_enable_rag: bool = Field(default=False, alias="CLI_ENABLE_RAG")
-    rag_ollama_model: str = Field(default="embeddinggemma", alias="RAG_OLLAMA_MODEL")
-    cli_rag_max_distance: float = Field(default=0.5, alias="CLI_RAG_MAX_DISTANCE")
-    cli_rag_k: int = Field(default=3, alias="CLI_RAG_K")
-
-    # PGVector database settings (reused from RAG pipeline)
-    pg_host: str = Field(default="127.0.0.1", alias="PG_HOST")
-    pg_port: str = Field(default="5432", alias="PG_PORT")
-    pg_database: str = Field(default="rag_db", alias="PG_DATABASE")
-    pg_user: str = Field(default="user", alias="PG_USER")
-    pg_password: str = Field(default="password", alias="PG_PASSWORD")
-    pg_collection_name: str = Field(
-        default="reading_list_embs", alias="PG_COLLECTION_NAME"
+    cli_rag_k: int = Field(
+        default=3,
+        alias="CLI_RAG_K",
+        description="Number of candidate documents to retrieve from PGVector.",
     )
-
-    @property
-    def db_url(self) -> URL:
-        """Constructs the database connection URL object."""
-        return URL.create(
-            drivername="postgresql+psycopg2",
-            username=self.pg_user,
-            password=self.pg_password,
-            host=self.pg_host,
-            port=self.pg_port,
-            database=self.pg_database,
-        )
-
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
-        extra = "ignore"
+    cli_rag_max_distance: float = Field(
+        default=0.5,
+        alias="CLI_RAG_MAX_DISTANCE",
+        description="Maximum L2 distance for a retrieved document to be included in context.",
+    )
 
 
 settings = Settings()

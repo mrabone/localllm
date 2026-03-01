@@ -1,41 +1,44 @@
-from sqlalchemy import create_engine
+import logging
+from typing import Optional
+
 from langchain_ollama import OllamaEmbeddings
 from langchain_postgres import PGVector
 from ollama import Client
-from typing import Optional
+from sqlalchemy import create_engine
 
 from cli.config import settings
 
+logger = logging.getLogger(__name__)
 
-def _init_ollama_client() -> Client:
-    """Initialize the Ollama client."""
+
+def get_ollama_client() -> Client:
+    """Create and return an Ollama client pointed at the configured base URL."""
     return Client(host=settings.ollama_base_url)
 
 
-def _init_rag_store() -> Optional[PGVector]:
-    """Initialize the PGVector store for RAG if enabled."""
+def get_rag_store() -> Optional[PGVector]:
+    """Create and return a PGVector store, or None if RAG is disabled.
+
+    Returns None without raising if RAG is disabled via CLI_ENABLE_RAG=false,
+    or if the database connection fails — allowing the app to run in
+    RAG-less mode gracefully.
+    """
     if not settings.cli_enable_rag:
         return None
 
     try:
-        ollama_embeddings = OllamaEmbeddings(
-            base_url=settings.ollama_base_url, model=settings.rag_ollama_model
+        embeddings = OllamaEmbeddings(
+            base_url=settings.ollama_base_url,
+            model=settings.rag_ollama_model,
         )
         engine = create_engine(settings.db_url)
-        pg_vector_store = PGVector(
+        store = PGVector(
             connection=engine,
-            embeddings=ollama_embeddings,
+            embeddings=embeddings,
             collection_name=settings.pg_collection_name,
         )
-        print(
-            f"RAG enabled: Connected to PGVector collection '{settings.pg_collection_name}'"
-        )
-        return pg_vector_store
+        print(f"Connected to PGVector collection '{settings.pg_collection_name}'")
+        return store
     except Exception as e:
-        print(f"Warning: Failed to initialize RAG: {e}")
+        logger.warning("Failed to initialise RAG store: %s", e)
         return None
-
-
-# Initialize services at module level
-ollama_client = _init_ollama_client()
-pgvector_store = _init_rag_store()

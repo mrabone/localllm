@@ -1,8 +1,9 @@
 [tool.uv.workspace]
-members = ["cli", "rag"]
+members = ["cli", "common", "rag"]
 
 [tool.uv.sources]
 cli = { workspace = true }
+common = { workspace = true }
 rag = { workspace = true }
 
 [project]
@@ -11,5 +12,11 @@ version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [
     "cli",
+    "common",
     "rag",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
 ]
