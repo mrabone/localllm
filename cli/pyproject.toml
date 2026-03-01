@@ -4,14 +4,20 @@ version = "0.1.0"
 description = "CLI for interacting with a local LLM"
 requires-python = ">=3.11"
 dependencies = [
+    "common",
     "ollama>=0.6.1",
     "langchain",
     "langchain-community",
-    "psycopg2-binary",
     "langchain-ollama",
     "langchain-postgres",
+    "psycopg2-binary",
+    "pydantic>=2.0",
+    "pydantic-settings>=2.0",
     "sqlalchemy",
 ]
+
+[tool.uv.sources]
+common = { workspace = true }
 
 [tool.setuptools]
 package-dir = {"" = "src"}

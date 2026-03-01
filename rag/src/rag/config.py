@@ -1,27 +1,46 @@
-from pydantic_settings import BaseSettings
 from pydantic import Field
+from pydantic_settings import SettingsConfigDict
+
+from common.config import SharedSettings
 
 
-class Settings(BaseSettings):
-    pg_host: str = Field(default="127.0.0.1", alias="PG_HOST")
-    pg_port: str = Field(default="5432", alias="PG_PORT")
-    pg_database: str = Field(default="rag_db", alias="PG_DATABASE")
-    pg_user: str = Field(default="user", alias="PG_USER")
-    pg_password: str = Field(default="password", alias="PG_PASSWORD")
-    pg_collection_name: str = Field(
-        default="reading_list_embs", alias="PG_COLLECTION_NAME"
+class Settings(SharedSettings):
+    """Settings for the RAG ingestion pipeline.
+
+    Inherits all shared PostgreSQL and Ollama fields from SharedSettings.
+    Pipeline-specific settings control scraping concurrency, rate limiting,
+    and the semantic chunker behaviour.
+    """
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
     )
-    ollama_base_url: str = Field(
-        default="http://127.0.0.1:11434", alias="OLLAMA_BASE_URL"
-    )
-    rag_ollama_model: str = Field(default="embeddinggemma", alias="RAG_OLLAMA_MODEL")
-    concurrent_requests: int = Field(default=5, alias="CONCURRENT_REQUESTS")
-    request_delay: int = Field(default=1, alias="REQUEST_DELAY")
 
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
-        extra = "ignore"
+    # Async scraping concurrency
+    concurrent_requests: int = Field(
+        default=5,
+        alias="CONCURRENT_REQUESTS",
+        description="Number of concurrent HTTP requests and consumer workers.",
+    )
+    request_delay: float = Field(
+        default=1.0,
+        alias="REQUEST_DELAY",
+        description="Seconds to wait before each HTTP request (per worker).",
+    )
+
+    # SemanticChunker tuning — see experiments/chunking_strategy_evaluation.ipynb
+    chunker_breakpoint_type: str = Field(
+        default="percentile",
+        alias="CHUNKER_BREAKPOINT_TYPE",
+        description="Breakpoint threshold type for SemanticChunker (e.g. 'percentile', 'standard_deviation').",
+    )
+    chunker_breakpoint_amount: float = Field(
+        default=60.0,
+        alias="CHUNKER_BREAKPOINT_AMOUNT",
+        description="Breakpoint threshold amount for SemanticChunker.",
+    )
 
 
 settings = Settings()
