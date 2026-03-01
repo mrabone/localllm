@@ -12,11 +12,11 @@ services:
       - ollama_data:/root/.ollama
       - ./Modelfile:/Modelfile
     healthcheck:
-      test: [ "CMD", "curl", "-f", "http://127.0.0.1:11434/api/tags" ]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-      start_period: 10s
+      test: [ "CMD", "ollama", "list" ]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
     deploy:
       resources:
         limits:
@@ -69,6 +69,29 @@ services:
       timeout: 5s
       retries: 5
       start_period: 10s
+
+  server:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    container_name: localllm-server
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - PG_HOST=db
+      - PG_PORT=5432
+      - PG_DATABASE=rag_db
+      - PG_USER=user
+      - PG_PASSWORD=password
+      - SERVER_HOST=0.0.0.0
+      - SERVER_PORT=8000
+    depends_on:
+      ollama:
+        condition: service_healthy
+      db:
+        condition: service_healthy
 
 volumes:
   ollama_data:

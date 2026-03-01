@@ -1,19 +1,20 @@
-PROJECTS_DIRS = cli rag
-
-.PHONY: setup run-cli sync-deps up down run-rag
+.PHONY: setup run-cli sync-deps run-rag test down
 
 setup:
-	docker compose down && docker compose up
+	docker compose down && docker compose up -d
 
 run-cli:
-	uv run cli/src/cli/main.py
+	uv run --package cli python -m cli.main $(SESSION_ARGS)
 
 sync-deps:
 	@echo "Syncing workspace dependencies..."
-	@$(foreach dir,$(PROJECTS_DIRS), \
-		echo "Installing dependencies for $$dir..."; \
-		(cd $(dir) && uv pip install -e .); \
-	)
+	uv sync
 
 run-rag:
-	uv run rag/src/rag/main.py
+	uv run --package rag python -m rag.main
+
+test:
+	uv run pytest
+
+down:
+	docker compose down

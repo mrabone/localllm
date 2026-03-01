@@ -1,0 +1,28 @@
+[project]
+name = "server"
+version = "0.1.0"
+description = "HTTP server for the localLLM chat application"
+requires-python = ">=3.11"
+dependencies = [
+    "common",
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "httpx>=0.28.0",
+    "sse-starlette>=2.1.0",
+    "langchain",
+    "langchain-community",
+    "langchain-ollama",
+    "langchain-postgres",
+    "ollama>=0.6.1",
+    "psycopg2-binary",
+    "pydantic>=2.0",
+    "pydantic-settings>=2.0",
+    "sqlalchemy",
+]
+
+[tool.uv.sources]
+common = { workspace = true }
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+packages = ["server"]
