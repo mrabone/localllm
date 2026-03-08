@@ -73,18 +73,27 @@ def get_rag_context(query: str, pgvector_store: PGVector | None) -> RagResult | 
         return None
 
 
-def build_rag_prompt(user_query: str, context: str) -> str:
-    """Wrap a user query with retrieved context to form a RAG-enriched prompt.
+def build_rag_system_message(context: str) -> str:
+    """Build a system message containing retrieved knowledge base documents.
+
+    Returns a string suitable for use as the content of a ``system`` role
+    message injected immediately before the current user turn.  By placing RAG
+    context in a dedicated system message rather than embedding it inside the
+    user turn we keep a clear separation between:
+
+    - what the *user* said (the ``user`` message)
+    - background knowledge the model has been given (this ``system`` message)
+
+    The fallback instruction ("answer based on general knowledge if not
+    relevant") is intentionally omitted: the caller only invokes this function
+    when ``get_rag_context`` has already confirmed that relevant documents
+    exist, so the fallback is never needed.
 
     Args:
-        user_query: The original question from the user.
         context: The formatted context string from get_rag_context().
     """
     return (
-        "Use the following relevant information to answer the user's question. "
-        "If the context doesn't contain relevant information, answer based on "
-        "your general knowledge.\n\n"
-        f"Context:\n{context}\n\n"
-        f"User Question: {user_query}\n\n"
-        "Answer:"
+        "The following documents were retrieved from the knowledge base as "
+        "relevant to the current question. Use them to inform your answer:\n\n"
+        f"{context}"
     )
