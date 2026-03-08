@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+from unittest.mock import patch
 
 from rag.main import extract_text_from_html, load_reading_list
 
@@ -38,23 +39,28 @@ class TestLoadReadingList:
 
 class TestExtractTextFromHtml:
     def test_extracts_text_from_main_tag(self):
+        """Trafilatura or BeautifulSoup fallback should find text in <main>."""
         html = "<html><body><main><p>Main content here</p></main></body></html>"
         result = extract_text_from_html(html)
-        assert result == "Main content here"
+        assert result is not None
+        assert "Main content here" in result
 
     def test_falls_back_to_body_when_no_main(self):
         html = "<html><body><p>Body content</p></body></html>"
         result = extract_text_from_html(html)
+        assert result is not None
         assert "Body content" in result
 
     def test_collapses_multiple_spaces(self):
         html = "<html><body><p>too   many    spaces</p></body></html>"
         result = extract_text_from_html(html)
+        assert result is not None
         assert "too many spaces" in result
 
     def test_collapses_excessive_newlines(self):
         html = "<html><body><p>line one</p>\n\n\n\n<p>line two</p></body></html>"
         result = extract_text_from_html(html)
+        assert result is not None
         # Should not have more than two consecutive newlines
         assert "\n\n\n" not in result
 
@@ -68,3 +74,17 @@ class TestExtractTextFromHtml:
         result = extract_text_from_html(html)
         assert result is not None
         assert result == result.strip()
+
+    def test_uses_trafilatura_when_it_returns_content(self):
+        """When trafilatura succeeds it should be preferred over BeautifulSoup."""
+        with patch("rag.main.trafilatura.extract", return_value="trafilatura result"):
+            result = extract_text_from_html("<html><body><p>ignored</p></body></html>")
+        assert result == "trafilatura result"
+
+    def test_falls_back_to_beautifulsoup_when_trafilatura_returns_none(self):
+        """BeautifulSoup fallback should be used when trafilatura yields nothing."""
+        html = "<html><body><p>fallback content</p></body></html>"
+        with patch("rag.main.trafilatura.extract", return_value=None):
+            result = extract_text_from_html(html)
+        assert result is not None
+        assert "fallback content" in result
