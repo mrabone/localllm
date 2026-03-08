@@ -19,7 +19,6 @@ class TestGetRagContext:
     def test_returns_none_when_best_score_exceeds_threshold(self):
         store = MagicMock()
         doc = MagicMock()
-        # Score of 0.9 is above the default max_distance of 0.5
         store.similarity_search_with_score.return_value = [(doc, 0.9)]
 
         result = get_rag_context("query", store)
@@ -53,7 +52,7 @@ class TestGetRagContext:
         far_doc.metadata = {"source": "http://example.com/far"}
         store.similarity_search_with_score.return_value = [
             (close_doc, 0.2),
-            (far_doc, 0.8),  # above default threshold of 0.5
+            (far_doc, 0.8),
         ]
 
         result = get_rag_context("query", store)
@@ -88,7 +87,7 @@ class TestGetRagContext:
         store = MagicMock()
         doc = MagicMock()
         doc.page_content = "content"
-        doc.metadata = {}  # no "source" key
+        doc.metadata = {}
         store.similarity_search_with_score.return_value = [(doc, 0.1)]
 
         result = get_rag_context("query", store)

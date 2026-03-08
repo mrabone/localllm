@@ -24,6 +24,11 @@ dependencies = [
 [tool.uv.sources]
 common = { workspace = true }
 
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+]
+
 [tool.setuptools]
 package-dir = {"" = "src"}
 packages = ["server"]

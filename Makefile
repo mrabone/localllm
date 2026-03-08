@@ -1,4 +1,4 @@
-.PHONY: setup dev prod run-cli sync-deps run-rag test down
+.PHONY: setup dev prod run-cli sync-deps run-rag test test-cli test-server test-rag down
 
 dev:
 	docker compose down
@@ -23,6 +23,15 @@ run-rag:
 
 test:
 	uv run pytest -v
+
+test-cli:
+	uv run pytest -v cli/tests
+
+test-server:
+	uv run pytest -v server/tests
+
+test-rag:
+	uv run pytest -v rag/tests
 
 down:
 	docker compose down

@@ -52,7 +52,6 @@ class TestGetOrCreateSessionAnonymous:
 
         assert result_id == session_id
         assert result_name == ""
-        # No registry entry should be written for anonymous sessions.
         assert not registry_file.exists() or json.loads(registry_file.read_text()) == {}
 
     def test_prints_hint_with_no_existing_sessions(self, tmp_path, capsys):
@@ -116,7 +115,6 @@ class TestGetOrCreateSessionNamed:
     def test_reuses_valid_named_session_via_head(self, tmp_path):
         session_id = uuid.uuid4()
         registry_file = tmp_path / "sessions.json"
-        # Pre-populate registry without a cache entry so it must HEAD-check.
         registry_file.write_text(json.dumps({"work": str(session_id)}))
 
         head_called = []
@@ -139,7 +137,6 @@ class TestGetOrCreateSessionNamed:
     def test_skips_server_call_within_cache_ttl(self, tmp_path):
         session_id = uuid.uuid4()
         registry_file = tmp_path / "sessions.json"
-        # Write a registry with a fresh cache timestamp.
         registry_file.write_text(
             json.dumps(
                 {
@@ -166,7 +163,6 @@ class TestGetOrCreateSessionNamed:
     def test_revalidates_after_cache_ttl_expires(self, tmp_path):
         session_id = uuid.uuid4()
         registry_file = tmp_path / "sessions.json"
-        # Write a registry with an expired cache timestamp.
         registry_file.write_text(
             json.dumps(
                 {

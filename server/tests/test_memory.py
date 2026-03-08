@@ -49,7 +49,6 @@ class TestCreateSession:
         with patch("server.memory._get_conn", return_value=mock_conn):
             session_id = create_session("dsn")
         str_id = str(session_id)
-        # UUID format: 8-4-4-4-12 hex characters
         assert len(str_id) == 36
         assert str_id.count("-") == 4
 
@@ -336,7 +335,7 @@ class TestLoadMessages:
         mem0 = MagicMock()
         mem0.get_all.return_value = [
             {"memory": "Valid memory"},
-            {"other_field": "value"},  # No memory/content/data field
+            {"other_field": "value"},
             {"memory": "Another valid memory"},
         ]
 
@@ -487,11 +486,6 @@ class TestLoadMessages:
         assert len(messages) == 10
 
 
-# ---------------------------------------------------------------------------
-# TestEnsureTurnsTable
-# ---------------------------------------------------------------------------
-
-
 class TestEnsureTurnsTable:
     def test_executes_create_table_and_index(self):
         """ensure_turns_table should execute CREATE TABLE (sessions), CREATE TABLE (turns) and CREATE INDEX statements."""
@@ -512,11 +506,6 @@ class TestEnsureTurnsTable:
         with patch("server.memory._get_conn", return_value=mock_conn):
             with pytest.raises(Exception, match="DB error"):
                 ensure_turns_table("host=localhost dbname=test")
-
-
-# ---------------------------------------------------------------------------
-# TestAppendTurn
-# ---------------------------------------------------------------------------
 
 
 class TestAppendTurn:
@@ -568,11 +557,6 @@ class TestAppendTurn:
         _, params = mock_cur.execute.call_args[0]
         assert params[0] == str(session_id)
         assert isinstance(params[0], str)
-
-
-# ---------------------------------------------------------------------------
-# TestLoadWindow
-# ---------------------------------------------------------------------------
 
 
 class TestLoadWindow:
@@ -652,11 +636,6 @@ class TestLoadWindow:
         assert params[1] == 10
 
 
-# ---------------------------------------------------------------------------
-# TestLoadLongTermMemories
-# ---------------------------------------------------------------------------
-
-
 class TestLoadLongTermMemories:
     def test_returns_single_consolidated_system_message(self):
         """load_long_term_memories should return a single system message containing
@@ -674,7 +653,6 @@ class TestLoadLongTermMemories:
         assert messages[0]["role"] == "system"
         assert "User likes Python" in messages[0]["content"]
         assert "User is a senior engineer" in messages[0]["content"]
-        # Facts should be formatted as bullet points
         assert "- User likes Python" in messages[0]["content"]
         assert "- User is a senior engineer" in messages[0]["content"]
 
@@ -686,9 +664,8 @@ class TestLoadLongTermMemories:
         messages = load_long_term_memories(mem0, uuid.uuid4())
 
         assert len(messages) == 1
-        # Header should appear before the bullet point
         content = messages[0]["content"]
-        assert content.index("A fact") > 0  # preceded by header text
+        assert content.index("A fact") > 0
 
     def test_respects_long_term_max_cap(self):
         """load_long_term_memories should include at most long_term_max facts."""
@@ -698,7 +675,6 @@ class TestLoadLongTermMemories:
         session_id = uuid.uuid4()
         messages = load_long_term_memories(mem0, session_id, long_term_max=3)
 
-        # Still returns a single message, but with only 3 bullet points
         assert len(messages) == 1
         content = messages[0]["content"]
         assert content.count("- fact") == 3
@@ -756,7 +732,6 @@ class TestLoadLongTermMemories:
         assert len(messages) == 1
         assert "Valid fact" in messages[0]["content"]
         assert "Another valid fact" in messages[0]["content"]
-        # The entry with no content should not appear
         assert "no content" not in messages[0]["content"]
 
     def test_always_uses_system_role_regardless_of_source_role(self):

@@ -113,12 +113,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
 
 def get_mem0() -> Memory:
-    assert _mem0 is not None, "Mem0 not initialised"
+    if _mem0 is None:
+        raise RuntimeError("Mem0 not initialised")
     return _mem0
 
 
 def get_ollama_client() -> Client:
-    assert _ollama_client is not None, "Ollama client not initialised"
+    if _ollama_client is None:
+        raise RuntimeError("Ollama client not initialised")
     return _ollama_client
 
 
@@ -127,7 +129,8 @@ def get_rag_store() -> PGVector | None:
 
 
 def get_pg_dsn() -> str:
-    assert _pg_dsn is not None, "PostgreSQL DSN not initialised"
+    if _pg_dsn is None:
+        raise RuntimeError("PostgreSQL DSN not initialised")
     return _pg_dsn
 
 

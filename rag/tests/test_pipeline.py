@@ -61,7 +61,6 @@ class TestExtractTextFromHtml:
         html = "<html><body><p>line one</p>\n\n\n\n<p>line two</p></body></html>"
         result = extract_text_from_html(html)
         assert result is not None
-        # Should not have more than two consecutive newlines
         assert "\n\n\n" not in result
 
     def test_returns_none_for_empty_content(self):
