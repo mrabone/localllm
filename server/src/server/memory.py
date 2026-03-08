@@ -1,5 +1,6 @@
 import logging
 import uuid
+from typing import Any
 
 import psycopg2
 import psycopg2.extras
@@ -7,6 +8,35 @@ import psycopg2.pool
 from mem0 import Memory
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Mem0 response normalisation helpers
+# ---------------------------------------------------------------------------
+def _normalise_mem0_results(results: Any) -> list[dict]:
+    """Unwrap the Mem0 API response into a plain list of memory dicts.
+
+    Mem0's PGVector provider returns results in several shapes depending on
+    version: a plain list, a dict with a ``"results"`` key, or a dict with a
+    ``"data"`` key.  This helper normalises all three forms into a single flat
+    list so callers don't need to repeat the branching logic.
+    """
+    if isinstance(results, dict):
+        return results.get("results", results.get("data", []))
+    if isinstance(results, list):
+        return results
+    return []
+
+
+def _extract_memory_content(m: dict) -> str | None:
+    """Return the content string from a Mem0 memory dict, or None if absent.
+
+    Mem0 uses different field names across provider versions:
+    ``memory`` (PGVector), ``content``, ``data``, and ``text``.
+    The fields are tried in that priority order.
+    """
+    return m.get("memory") or m.get("content") or m.get("data") or m.get("text")
+
 
 # ---------------------------------------------------------------------------
 # PostgreSQL connection pool
@@ -317,6 +347,11 @@ def load_messages(
 ) -> list[dict[str, str]]:
     """Retrieve semantically relevant memories for the given query.
 
+    NOTE: This function is used exclusively by the ``GET /sessions/{id}``
+    history-viewing endpoint.  The chat path does **not** call it — it uses
+    ``load_long_term_memories`` (layer 1) and ``load_window`` (layer 2)
+    instead.
+
     Returns a list of dicts with ``role`` and ``content`` keys, ready to pass
     directly into the Ollama chat messages list.  If ``query`` is empty all
     stored memories are returned via ``get_all``.
@@ -324,10 +359,6 @@ def load_messages(
     At most ``max_messages`` entries are returned.  Mem0 already ranks results
     by relevance, so truncating the tail discards the least-relevant memories
     and keeps the context window from growing without bound.
-
-    Note: Mem0's PGVector provider returns messages with various field names
-    depending on the version and configuration. We normalize all possible
-    formats here.
     """
     str_session_id = str(session_id)
     logger.debug(
@@ -339,51 +370,36 @@ def load_messages(
     try:
         if not query:
             logger.debug("Query is empty, calling get_all()")
-            results = mem0.get_all(user_id=str_session_id)
+            raw = mem0.get_all(user_id=str_session_id)
             logger.debug(
                 "get_all() returned: type=%s, len=%d",
-                type(results),
-                len(results) if isinstance(results, (list, dict)) else 0,
+                type(raw),
+                len(raw) if isinstance(raw, (list, dict)) else 0,
             )
-            # Mem0 can return either a dict with "results" key or a plain list
-            if isinstance(results, dict):
-                memories = results.get("results", results.get("data", []))
-            else:
-                memories = results if isinstance(results, list) else []
+            memories = _normalise_mem0_results(raw)
             logger.debug(
                 "After normalization: memories type=%s, len=%d",
                 type(memories),
-                len(memories) if isinstance(memories, list) else 0,
+                len(memories),
             )
         else:
             logger.debug("Query is non-empty, calling search()")
-            memories = mem0.search(query, user_id=str_session_id)
+            raw = mem0.search(query, user_id=str_session_id)
             logger.debug(
                 "search() returned: type=%s, len=%d",
-                type(memories),
-                len(memories) if isinstance(memories, list) else 0,
+                type(raw),
+                len(raw) if isinstance(raw, (list, dict)) else 0,
             )
-            # Ensure memories is a list
-            if isinstance(memories, dict):
-                memories = memories.get("results", memories.get("data", []))
-            elif not isinstance(memories, list):
-                memories = []
+            memories = _normalise_mem0_results(raw)
 
-        # Mem0/PGVector returns results with various possible field names.
-        # Normalize to standard message format.
+        # Build standard {role, content} dicts from normalised memory entries.
         messages = []
         for m in memories:
             if not isinstance(m, dict):
                 logger.debug("Skipping non-dict memory item: %s", type(m))
                 continue
 
-            # Try different field names for the memory content
-            # PGVector provider uses: role, content, memory, data, text, hash, metadata
-            memory_content = (
-                m.get("memory") or m.get("content") or m.get("data") or m.get("text")
-            )
-
-            # Try to extract the role (default to "system" for context)
+            memory_content = _extract_memory_content(m)
             memory_role = m.get("role", "system")
 
             if memory_content:
@@ -461,27 +477,20 @@ def load_long_term_memories(
         long_term_max,
     )
     try:
-        results = mem0.get_all(user_id=str_session_id)
+        raw = mem0.get_all(user_id=str_session_id)
         logger.debug(
             "get_all() returned: type=%s, len=%d",
-            type(results),
-            len(results) if isinstance(results, (list, dict)) else 0,
+            type(raw),
+            len(raw) if isinstance(raw, (list, dict)) else 0,
         )
 
-        if isinstance(results, dict):
-            memories = results.get("results", results.get("data", []))
-        elif isinstance(results, list):
-            memories = results
-        else:
-            memories = []
+        memories = _normalise_mem0_results(raw)
 
         facts: list[str] = []
         for m in memories:
             if not isinstance(m, dict):
                 continue
-            memory_content = (
-                m.get("memory") or m.get("content") or m.get("data") or m.get("text")
-            )
+            memory_content = _extract_memory_content(m)
             if memory_content:
                 facts.append(str(memory_content))
 

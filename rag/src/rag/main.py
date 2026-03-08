@@ -130,31 +130,27 @@ def extract_text_from_html(html: str) -> str | None:
 def chunk_documents(
     text: str,
     url: str,
-    embeddings: OllamaEmbeddings,
+    splitter: SemanticChunker,
 ) -> list[Document]:
-    """Split text into semantic chunks using the configured SemanticChunker.
+    """Split text into semantic chunks using the provided SemanticChunker.
 
     Args:
         text: The cleaned plain text to split.
         url: The source URL, stored in each chunk's metadata.
-        embeddings: The embeddings model used to determine split points.
+        splitter: A pre-built SemanticChunker instance (constructed once per
+            pipeline run to avoid repeated initialisation overhead).
 
     Returns:
         A list of Document chunks, or an empty list if splitting produced nothing.
     """
     document = Document(page_content=text, metadata={"source": url})
-    splitter = SemanticChunker(
-        embeddings,
-        breakpoint_threshold_type=settings.chunker_breakpoint_type,
-        breakpoint_threshold_amount=settings.chunker_breakpoint_amount,
-    )
     return splitter.split_documents([document])
 
 
 async def process_item(
     item: dict,
     pgvector_store: PGVector,
-    embeddings: OllamaEmbeddings,
+    splitter: SemanticChunker,
     semaphore: asyncio.Semaphore,
     delay: float,
 ) -> None:
@@ -166,7 +162,8 @@ async def process_item(
     Args:
         item: A reading-list dict with 'url' and optional 'title' keys.
         pgvector_store: Destination vector store.
-        embeddings: Embeddings model for chunking and storage.
+        splitter: Pre-built SemanticChunker (shared across all items to avoid
+            repeated instantiation overhead).
         semaphore: Concurrency limiter passed through to the scraper.
         delay: Per-request delay in seconds passed through to the scraper.
     """
@@ -206,7 +203,7 @@ async def process_item(
 
     # 4. Chunk
     try:
-        chunks = chunk_documents(text, url, embeddings)
+        chunks = chunk_documents(text, url, splitter)
     except Exception as e:
         logger.error("Error chunking %s: %s", url, e)
         return
@@ -245,7 +242,7 @@ async def producer(
 async def consumer(
     queue: asyncio.Queue,
     pgvector_store: PGVector,
-    embeddings: OllamaEmbeddings,
+    splitter: SemanticChunker,
     semaphore: asyncio.Semaphore,
 ) -> None:
     """Consume items from the queue until a ``None`` sentinel is received.
@@ -265,7 +262,7 @@ async def consumer(
             await process_item(
                 item,
                 pgvector_store,
-                embeddings,
+                splitter,
                 semaphore,
                 settings.request_delay,
             )
@@ -310,6 +307,15 @@ async def run_pipeline(data_path: Path) -> None:
     )
     logger.info("Embeddings model ready.")
 
+    # Build the chunker once here so workers share the same instance rather
+    # than each item constructing a new one inside chunk_documents().
+    splitter = SemanticChunker(
+        embeddings,
+        breakpoint_threshold_type=settings.chunker_breakpoint_type,
+        breakpoint_threshold_amount=settings.chunker_breakpoint_amount,
+    )
+    logger.info("SemanticChunker ready.")
+
     try:
         logger.info("Connecting to PGVector store...")
         pgvector_store = init_pgvector_store(embeddings)
@@ -324,7 +330,7 @@ async def run_pipeline(data_path: Path) -> None:
 
     producer_task = asyncio.create_task(producer(queue, reading_list, num_consumers))
     consumer_tasks = [
-        asyncio.create_task(consumer(queue, pgvector_store, embeddings, semaphore))
+        asyncio.create_task(consumer(queue, pgvector_store, splitter, semaphore))
         for _ in range(num_consumers)
     ]
 

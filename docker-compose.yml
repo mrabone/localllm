@@ -58,13 +58,13 @@ services:
     ports:
       - "5432:5432"
     environment:
-      POSTGRES_DB: rag_db
-      POSTGRES_USER: user
-      POSTGRES_PASSWORD: password
+      POSTGRES_DB: ${PG_DATABASE:-rag_db}
+      POSTGRES_USER: ${PG_USER:-user}
+      POSTGRES_PASSWORD: ${PG_PASSWORD:-password}
     volumes:
       - db_data:/var/lib/postgresql/data
     healthcheck:
-      test: [ "CMD-SHELL", "pg_isready -U user -d rag_db" ]
+      test: [ "CMD-SHELL", "pg_isready -U ${PG_USER:-user} -d ${PG_DATABASE:-rag_db}" ]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -74,19 +74,24 @@ services:
     build:
       context: .
       dockerfile: server/Dockerfile
+      target: ${SERVER_BUILD_TARGET:-runtime}
     container_name: localllm-server
     restart: unless-stopped
     ports:
       - "8000:8000"
+    volumes:
+      - ./server/src/server:/usr/local/lib/python3.12/site-packages/server:ro
+      - ./common/src/common:/app/common/src/common:ro
     environment:
       - OLLAMA_BASE_URL=http://ollama:11434
       - PG_HOST=db
       - PG_PORT=5432
-      - PG_DATABASE=rag_db
-      - PG_USER=user
-      - PG_PASSWORD=password
+      - PG_DATABASE=${PG_DATABASE:-rag_db}
+      - PG_USER=${PG_USER:-user}
+      - PG_PASSWORD=${PG_PASSWORD:-password}
       - SERVER_HOST=0.0.0.0
       - SERVER_PORT=8000
+      - SERVER_RELOAD=${SERVER_RELOAD:-false}
     depends_on:
       ollama:
         condition: service_healthy

@@ -158,7 +158,7 @@ def main() -> None:
         "server.main:app",
         host=settings.server_host,
         port=settings.server_port,
-        reload=False,
+        reload=settings.server_reload,
     )
 
 

@@ -1,8 +1,8 @@
+import json
 import logging
 import time
 import uuid
 from pathlib import Path
-from typing import Optional
 
 import httpx
 
@@ -34,16 +34,12 @@ class SessionRegistry:
         if not self._path.exists():
             return {}
         try:
-            import json
-
             return json.loads(self._path.read_text())
         except Exception:
             logger.warning("Sessions registry is corrupt; starting fresh.")
             return {}
 
     def save(self) -> None:
-        import json
-
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._path.write_text(json.dumps(self._data, indent=2))
 
@@ -51,7 +47,7 @@ class SessionRegistry:
     # Session UUID access
     # ------------------------------------------------------------------
 
-    def get_uuid(self, name: str) -> Optional[uuid.UUID]:
+    def get_uuid(self, name: str) -> uuid.UUID | None:
         """Return the UUID for *name*, or None if absent or unparseable."""
         raw = self._data.get(name)
         if raw is None:
@@ -138,7 +134,7 @@ def list_sessions() -> list[str]:
 
 def get_or_create_session(
     client: httpx.Client,
-    name: Optional[str] = None,
+    name: str | None = None,
 ) -> tuple[uuid.UUID, str]:
     """Return ``(session_id, name)`` for the requested session.
 
