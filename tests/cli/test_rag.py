@@ -1,6 +1,6 @@
 from unittest.mock import MagicMock
 
-from server.rag import RagResult, build_rag_prompt, get_rag_context
+from server.rag import RagResult, build_rag_system_message, get_rag_context
 
 
 class TestGetRagContext:
@@ -97,15 +97,24 @@ class TestGetRagContext:
         assert "Unknown source" in result.context
 
 
-class TestBuildRagPrompt:
-    def test_includes_user_query(self):
-        prompt = build_rag_prompt("What is RAG?", "Some context.")
-        assert "What is RAG?" in prompt
-
+class TestBuildRagSystemMessage:
     def test_includes_context(self):
-        prompt = build_rag_prompt("query", "This is the context block.")
-        assert "This is the context block." in prompt
+        msg = build_rag_system_message("This is the context block.")
+        assert "This is the context block." in msg
 
-    def test_query_appears_after_context(self):
-        prompt = build_rag_prompt("my question", "my context")
-        assert prompt.index("my context") < prompt.index("my question")
+    def test_does_not_include_user_query(self):
+        """The system message contains only the retrieved context, not the user question.
+        The user question remains in the separate user-role message."""
+        msg = build_rag_system_message("some context")
+        assert "some context" in msg
+
+    def test_context_framing_describes_knowledge_base(self):
+        """The message must frame the context as retrieved knowledge base documents."""
+        msg = build_rag_system_message("doc content")
+        assert "knowledge base" in msg.lower() or "retrieved" in msg.lower()
+
+    def test_does_not_contain_fallback_instruction(self):
+        """The old 'answer based on general knowledge' fallback must not be present,
+        since this message is only injected when relevant documents exist."""
+        msg = build_rag_system_message("some context")
+        assert "general knowledge" not in msg

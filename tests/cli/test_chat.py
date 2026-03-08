@@ -10,13 +10,15 @@ from cli.services import get_or_create_session, list_sessions
 
 
 def _make_sse_response(events: list[tuple[str, str]], status_code: int = 200) -> str:
-    """Build a raw SSE response body from a list of (event, data) tuples."""
-    lines = []
+    """Build a raw SSE response body from a list of (event, data) tuples.
+
+    Each event is terminated by a blank line as required by the SSE spec so
+    that httpx-sse correctly identifies event boundaries.
+    """
+    parts = []
     for event, data in events:
-        lines.append(f"event: {event}")
-        lines.append(f"data: {data}")
-        lines.append("")
-    return "\n".join(lines)
+        parts.append(f"event: {event}\ndata: {data}\n\n")
+    return "".join(parts)
 
 
 def _make_client_with_handler(handler):
@@ -370,3 +372,23 @@ class TestChatApplication:
 
         captured = capsys.readouterr()
         assert uuid_str in captured.out
+
+    def test_chat_handles_non_200_response(self, tmp_path, capsys):
+        """Non-200 responses must not raise ResponseNotRead (regression test)."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                503,
+                text="Service Unavailable",
+                headers={"content-type": "text/plain"},
+            )
+
+        app = self._make_app(handler, tmp_path)
+
+        with patch("cli.main.settings") as mock_settings:
+            mock_settings.server_url = "http://test"
+            app.chat("hi")  # must not raise
+
+        captured = capsys.readouterr()
+        assert "503" in captured.out
+        assert "Service Unavailable" in captured.out
