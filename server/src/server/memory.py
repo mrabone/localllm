@@ -10,9 +10,6 @@ from mem0 import Memory
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Mem0 response normalisation helpers
-# ---------------------------------------------------------------------------
 def _normalise_mem0_results(results: Any) -> list[dict]:
     """Unwrap the Mem0 API response into a plain list of memory dicts.
 
@@ -37,10 +34,6 @@ def _extract_memory_content(m: dict) -> str | None:
     """
     return m.get("memory") or m.get("content") or m.get("data") or m.get("text")
 
-
-# ---------------------------------------------------------------------------
-# PostgreSQL connection pool
-# ---------------------------------------------------------------------------
 
 # Module-level connection pool.  Initialised lazily on the first call to
 # _get_conn() so that imports don't require a live database.  Replaced by
@@ -152,10 +145,6 @@ def _get_conn(dsn: str) -> "_PooledConn":
     """
     return _PooledConn(dsn)
 
-
-# ---------------------------------------------------------------------------
-# PostgreSQL sliding-window helpers
-# ---------------------------------------------------------------------------
 
 _CREATE_SESSIONS_TABLE = """
 CREATE TABLE IF NOT EXISTS chat_sessions (
@@ -447,11 +436,6 @@ def load_messages(
             exc_info=True,
         )
         return []
-
-
-# ---------------------------------------------------------------------------
-# Long-term Mem0 memories (layer 1)
-# ---------------------------------------------------------------------------
 
 
 def load_long_term_memories(

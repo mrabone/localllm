@@ -58,7 +58,6 @@ class TestChat:
             token_stream, _ = session.chat("hello")
             list(token_stream)
 
-        # save_message: user before stream, assistant after
         assert mock_save.call_count == 2
         assert mock_save.call_args_list[0] == call(
             session.mem0, session.session_id, Role.USER.value, "hello"
@@ -67,7 +66,6 @@ class TestChat:
             session.mem0, session.session_id, Role.ASSISTANT.value, "hi"
         )
 
-        # append_turn: same pattern
         assert mock_append.call_count == 2
         assert mock_append.call_args_list[0] == call(
             _FAKE_DSN, session.session_id, Role.USER.value, "hello"
@@ -120,18 +118,15 @@ class TestChat:
             token_stream, rag_result = session.chat("original question")
             list(token_stream)
 
-        # build_rag_system_message receives only the context string, not the query
         mock_build.assert_called_once_with("some context")
         assert rag_result is mock_rag_result
 
-        # The RAG content must appear as a system message, not inside the user turn
         call_kwargs = session.client.chat.call_args[1]
         messages = call_kwargs["messages"]
         roles = [m["role"] for m in messages]
-        assert roles.count("system") >= 2  # orientation + RAG
+        assert roles.count("system") >= 2
         rag_msg = next(m for m in messages if m["content"] == "rag system msg")
         assert rag_msg["role"] == "system"
-        # The final user message must be the clean question, not the RAG-wrapped version
         assert messages[-1] == {"role": "user", "content": "original question"}
 
     def test_stream_yields_tokens(self):
@@ -190,21 +185,16 @@ class TestChat:
         call_kwargs = session.client.chat.call_args[1]
         messages = call_kwargs["messages"]
 
-        # Index 0: orientation system message (always present)
         assert messages[0]["role"] == "system"
         assert "helpful assistant" in messages[0]["content"]
 
-        # Index 1: consolidated long-term memory system message
         assert messages[1] == long_term[0]
 
-        # Index 2 & 3: sliding window turns
         assert messages[2] == {"role": "user", "content": "prev question"}
         assert messages[3] == {"role": "assistant", "content": "prev answer"}
 
-        # Index 4: current user turn — clean question, no RAG embedding
         assert messages[4] == {"role": "user", "content": "current question"}
 
-        # Total: 5 messages (orientation + 1 long_term + 2 window + 1 user)
         assert len(messages) == 5
 
     def test_long_term_memories_fetched_with_configured_max(self):
@@ -303,11 +293,10 @@ class TestChat:
         call_kwargs = session.client.chat.call_args[1]
         messages = call_kwargs["messages"]
 
-        # Structure: orientation, [no long-term], [no window], rag system msg, user turn
         assert len(messages) == 3
-        assert messages[0]["role"] == "system"  # orientation
-        assert messages[1] == {"role": "system", "content": "kb: doc content"}  # RAG
-        assert messages[2] == {"role": "user", "content": "my question"}  # clean query
+        assert messages[0]["role"] == "system"
+        assert messages[1] == {"role": "system", "content": "kb: doc content"}
+        assert messages[2] == {"role": "user", "content": "my question"}
 
     def test_no_rag_message_when_rag_disabled(self):
         """When RAG is disabled (no pgvector store) no RAG system message is present."""
@@ -327,9 +316,8 @@ class TestChat:
         call_kwargs = session.client.chat.call_args[1]
         messages = call_kwargs["messages"]
 
-        # Only orientation + user turn — no extra system messages
         assert len(messages) == 2
-        assert messages[0]["role"] == "system"  # orientation only
+        assert messages[0]["role"] == "system"
         assert messages[1] == {"role": "user", "content": "my question"}
 
     def test_orientation_message_is_always_first(self):

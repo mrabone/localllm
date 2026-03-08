@@ -26,10 +26,6 @@ class SessionRegistry:
         self._path = path
         self._data: dict = self._load()
 
-    # ------------------------------------------------------------------
-    # Persistence
-    # ------------------------------------------------------------------
-
     def _load(self) -> dict:
         if not self._path.exists():
             return {}
@@ -43,10 +39,6 @@ class SessionRegistry:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._path.write_text(json.dumps(self._data, indent=2))
 
-    # ------------------------------------------------------------------
-    # Session UUID access
-    # ------------------------------------------------------------------
-
     def get_uuid(self, name: str) -> uuid.UUID | None:
         """Return the UUID for *name*, or None if absent or unparseable."""
         raw = self._data.get(name)
@@ -59,10 +51,6 @@ class SessionRegistry:
 
     def set_uuid(self, name: str, session_id: uuid.UUID) -> None:
         self._data[name] = str(session_id)
-
-    # ------------------------------------------------------------------
-    # TTL cache
-    # ------------------------------------------------------------------
 
     def is_cache_valid(self, name: str) -> bool:
         """Return True if the cached validation timestamp for *name* is still fresh."""
@@ -81,18 +69,9 @@ class SessionRegistry:
     def invalidate_cache(self, name: str) -> None:
         self._data.get(_CACHE_KEY, {}).pop(name, None)
 
-    # ------------------------------------------------------------------
-    # Listing
-    # ------------------------------------------------------------------
-
     def names(self) -> list[str]:
         """Return all named session keys (excludes the internal cache key)."""
         return sorted(k for k in self._data if k != _CACHE_KEY)
-
-
-# ---------------------------------------------------------------------------
-# Server communication
-# ---------------------------------------------------------------------------
 
 
 def _session_alive(client: httpx.Client, session_id: uuid.UUID) -> bool:
@@ -119,11 +98,6 @@ def _create_remote_session(client: httpx.Client) -> uuid.UUID:
             f"Cannot reach server at {settings.server_url}: {exc}"
         ) from exc
     return uuid.UUID(resp.json()["session_id"])
-
-
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
 
 
 def list_sessions() -> list[str]:

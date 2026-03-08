@@ -76,10 +76,6 @@ class ChatSession:
         # Falls back to the shared module-level pool.
         self._executor = executor if executor is not None else _executor
 
-    # ------------------------------------------------------------------
-    # Streaming
-    # ------------------------------------------------------------------
-
     def _stream_response(
         self, context_messages: list[dict[str, str]]
     ) -> Generator[str, None, None]:
@@ -92,10 +88,6 @@ class ChatSession:
         )
         for chunk in stream:
             yield chunk["message"]["content"]
-
-    # ------------------------------------------------------------------
-    # Public entry point
-    # ------------------------------------------------------------------
 
     def chat(
         self, user_input: str
@@ -121,9 +113,6 @@ class ChatSession:
         its LLM-based extraction pass.  Errors are logged but do not affect
         the client.
         """
-        # ------------------------------------------------------------------
-        # Fan out all independent pre-stream I/O concurrently.
-        # ------------------------------------------------------------------
         f_long_term: Future = self._executor.submit(
             load_long_term_memories,
             self.mem0,
@@ -156,30 +145,6 @@ class ChatSession:
         # Persist user turn to the verbatim window (fast INSERT, done after
         # Mem0 save so ordering in tests is deterministic).
         append_turn(self.pg_dsn, self.session_id, Role.USER.value, user_input)
-
-        # ------------------------------------------------------------------
-        # Build the structured context message list.
-        #
-        # Layer 0 — orientation: a single system message that tells the model
-        #   what sources of context it has been given.  This replaces the
-        #   per-turn instructions that were previously embedded inside the
-        #   RAG-enriched user message.
-        #
-        # Layer 1 — long-term memories: a single consolidated system message
-        #   (returned by load_long_term_memories) listing Mem0-extracted facts,
-        #   or nothing if no facts exist yet.
-        #
-        # Layer 2 — sliding window: verbatim recent user/assistant turns.
-        #   No extra framing is needed; the model understands role alternation.
-        #
-        # Layer 3 — RAG knowledge base (optional): a dedicated system message
-        #   containing retrieved documents, injected only when results exist.
-        #   Keeping RAG in its own system message separates "background
-        #   knowledge" from "what the user said", which is more semantically
-        #   correct and matches how chat models expect context to be structured.
-        #
-        # Layer 4 — current user turn: the clean, unmodified user question.
-        # ------------------------------------------------------------------
 
         orientation = {
             "role": Role.SYSTEM.value,
