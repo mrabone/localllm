@@ -1,5 +1,4 @@
 import logging
-import os
 import time
 import uuid
 from pathlib import Path
@@ -15,65 +14,84 @@ logger = logging.getLogger(__name__)
 _CACHE_KEY = "_cache"
 
 
-def _registry_path() -> Path:
-    return Path(os.path.expanduser(settings.sessions_registry))
+class SessionRegistry:
+    """Manages the on-disk JSON registry that maps session names to UUIDs.
 
+    Encapsulates all file I/O, UUID parsing, and TTL-based cache validation so
+    that the public ``get_or_create_session`` function can focus purely on the
+    higher-level session lifecycle logic.
+    """
 
-def _load_registry() -> dict:
-    path = _registry_path()
-    if not path.exists():
-        return {}
-    try:
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._data: dict = self._load()
+
+    # ------------------------------------------------------------------
+    # Persistence
+    # ------------------------------------------------------------------
+
+    def _load(self) -> dict:
+        if not self._path.exists():
+            return {}
+        try:
+            import json
+
+            return json.loads(self._path.read_text())
+        except Exception:
+            logger.warning("Sessions registry is corrupt; starting fresh.")
+            return {}
+
+    def save(self) -> None:
         import json
 
-        return json.loads(path.read_text())
-    except Exception:
-        logger.warning("Sessions registry is corrupt; starting fresh.")
-        return {}
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._path.write_text(json.dumps(self._data, indent=2))
 
+    # ------------------------------------------------------------------
+    # Session UUID access
+    # ------------------------------------------------------------------
 
-def _save_registry(registry: dict) -> None:
-    import json
+    def get_uuid(self, name: str) -> Optional[uuid.UUID]:
+        """Return the UUID for *name*, or None if absent or unparseable."""
+        raw = self._data.get(name)
+        if raw is None:
+            return None
+        try:
+            return uuid.UUID(raw)
+        except (ValueError, AttributeError):
+            return None
 
-    path = _registry_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(registry, indent=2))
+    def set_uuid(self, name: str, session_id: uuid.UUID) -> None:
+        self._data[name] = str(session_id)
 
+    # ------------------------------------------------------------------
+    # TTL cache
+    # ------------------------------------------------------------------
 
-def _get_session_uuid(registry: dict, name: str) -> Optional[uuid.UUID]:
-    """Return the UUID for *name* from the registry, or None."""
-    raw = registry.get(name)
-    if raw is None:
-        return None
-    try:
-        return uuid.UUID(raw)
-    except (ValueError, AttributeError):
-        return None
+    def is_cache_valid(self, name: str) -> bool:
+        """Return True if the cached validation timestamp for *name* is still fresh."""
+        ttl = settings.session_cache_ttl
+        if ttl <= 0:
+            return False
+        entry = self._data.get(_CACHE_KEY, {}).get(name, {})
+        validated_at = entry.get("validated_at", 0.0)
+        return (time.time() - validated_at) < ttl
 
+    def update_cache(self, name: str) -> None:
+        if _CACHE_KEY not in self._data:
+            self._data[_CACHE_KEY] = {}
+        self._data[_CACHE_KEY][name] = {"validated_at": time.time()}
 
-def _set_session_uuid(registry: dict, name: str, session_id: uuid.UUID) -> None:
-    registry[name] = str(session_id)
+    def invalidate_cache(self, name: str) -> None:
+        self._data.get(_CACHE_KEY, {}).pop(name, None)
 
+    # ------------------------------------------------------------------
+    # Listing
+    # ------------------------------------------------------------------
 
-def _is_cache_valid(registry: dict, name: str) -> bool:
-    """Return True if the cached validation timestamp for *name* is still fresh."""
-    ttl = settings.session_cache_ttl
-    if ttl <= 0:
-        return False
-    cache = registry.get(_CACHE_KEY, {})
-    entry = cache.get(name, {})
-    validated_at = entry.get("validated_at", 0.0)
-    return (time.time() - validated_at) < ttl
-
-
-def _update_cache(registry: dict, name: str) -> None:
-    if _CACHE_KEY not in registry:
-        registry[_CACHE_KEY] = {}
-    registry[_CACHE_KEY][name] = {"validated_at": time.time()}
-
-
-def _invalidate_cache(registry: dict, name: str) -> None:
-    registry.get(_CACHE_KEY, {}).pop(name, None)
+    def names(self) -> list[str]:
+        """Return all named session keys (excludes the internal cache key)."""
+        return sorted(k for k in self._data if k != _CACHE_KEY)
 
 
 # ---------------------------------------------------------------------------
@@ -114,8 +132,8 @@ def _create_remote_session(client: httpx.Client) -> uuid.UUID:
 
 def list_sessions() -> list[str]:
     """Return all named sessions stored in the registry (sorted)."""
-    registry = _load_registry()
-    return sorted(k for k in registry if k != _CACHE_KEY)
+    registry = SessionRegistry(Path(settings.sessions_registry).expanduser())
+    return registry.names()
 
 
 def get_or_create_session(
@@ -133,21 +151,21 @@ def get_or_create_session(
     - If *name* is ``None``, always create a fresh session (no name is stored)
       and print a hint about ``--session`` so the user knows how to resume it.
     """
-    registry = _load_registry()
+    registry = SessionRegistry(Path(settings.sessions_registry).expanduser())
 
     if name is not None:
-        session_id = _get_session_uuid(registry, name)
+        session_id = registry.get_uuid(name)
 
         if session_id is not None:
             # Fast path: trust the cache without a server call.
-            if _is_cache_valid(registry, name):
+            if registry.is_cache_valid(name):
                 logger.debug("Session '%s' served from cache (TTL not expired).", name)
                 return session_id, name
 
             # Validate with server using lightweight HEAD request.
             if _session_alive(client, session_id):
-                _update_cache(registry, name)
-                _save_registry(registry)
+                registry.update_cache(name)
+                registry.save()
                 return session_id, name
 
             # Session gone (e.g. DB wiped) — create a replacement.
@@ -156,13 +174,13 @@ def get_or_create_session(
                 name,
                 session_id,
             )
-            _invalidate_cache(registry, name)
+            registry.invalidate_cache(name)
 
         # Either session was missing or just invalidated — create a new one.
         session_id = _create_remote_session(client)
-        _set_session_uuid(registry, name, session_id)
-        _update_cache(registry, name)
-        _save_registry(registry)
+        registry.set_uuid(name, session_id)
+        registry.update_cache(name)
+        registry.save()
         logger.info("Created session '%s' (%s).", name, session_id)
         return session_id, name
 

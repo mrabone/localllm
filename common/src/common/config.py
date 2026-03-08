@@ -38,6 +38,10 @@ class SharedSettings(BaseSettings):
         default="reading_list_embs",
         alias="PG_COLLECTION_NAME",
     )
+    mem0_collection_name: str = Field(
+        default="mem0_chat",
+        alias="MEM0_COLLECTION_NAME",
+    )
 
     @property
     def db_url(self) -> URL:
@@ -45,6 +49,10 @@ class SharedSettings(BaseSettings):
 
         Uses URL.create() rather than f-string interpolation so that special
         characters in the password are handled correctly.
+
+        WARNING: do NOT log or format this value directly — SQLAlchemy renders
+        the password in plain text when the URL is coerced to a string.
+        Use ``db_url_safe`` for any logging or display.
         """
         return URL.create(
             drivername="postgresql+psycopg2",
@@ -53,4 +61,16 @@ class SharedSettings(BaseSettings):
             host=self.pg_host,
             port=self.pg_port,
             database=self.pg_database,
+        )
+
+    @property
+    def db_url_safe(self) -> str:
+        """Return a redacted connection string safe for logging.
+
+        The password is replaced with ``***`` so the string can be included in
+        log messages or error output without leaking credentials.
+        """
+        return (
+            f"postgresql+psycopg2://{self.pg_user}:***"
+            f"@{self.pg_host}:{self.pg_port}/{self.pg_database}"
         )

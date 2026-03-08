@@ -6,8 +6,8 @@ Personal project where I experiment with LLMs locally.
 
 The project is split into four packages in a `uv` workspace:
 
-- **`server/`** — FastAPI HTTP server. Owns all chat logic: session management, conversation history (PostgreSQL), RAG retrieval (pgvector), summarisation, and streaming responses via SSE. Runs in Docker.
-- **`cli/`** — Thin terminal REPL. Sends user input to the server and renders the streamed response. Named sessions are stored in a local JSON registry at `~/.localllm_sessions.json`.
+- **`server/`** — FastAPI HTTP server. Owns all chat logic: session management, conversation memory (Mem0 with PGVector), RAG retrieval (pgvector), summarisation, and streaming responses via SSE. Runs in Docker.
+- **`cli/`** — Thin terminal REPL. Sends user input to the server and renders the streamed response. Named sessions are stored in a local JSON registry at `~/.localllm_sessions.json` (these UUIDs are used as Mem0 user IDs on the server).
 - **`rag/`** — One-shot pipeline that scrapes websites and ingests content into the pgvector store.
 - **`common/`** — Shared utilities used by `server` and `rag`.
 
@@ -17,7 +17,7 @@ The project is split into four packages in a `uv` workspace:
 - **Named sessions** - Save and resume conversations by name with `--session <name>`. Each run without a name starts a fresh session.
 - **Knowledge Base Integration** - Automatically import content from websites to let the assistant answer questions based on your custom data sources.
 - **Conversation history management** - Automatically summarizes old messages when the conversation gets long to maintain context.
-- **Persistent sessions** - Conversation history is stored in PostgreSQL and survives CLI restarts.
+- **Persistent sessions** - Conversation memory is stored in Mem0 (backed by PGVector in PostgreSQL) and survives CLI restarts. Note: Mem0 stores extracted semantic memories rather than a verbatim transcript.
 - **Customizable system prompt** - The assistant has a friendly, helpful personality.
 - **No internet required** - Everything runs locally with Docker and Ollama.
 - **Flexible model selection** - Easy to switch between different Ollama models.
@@ -75,7 +75,7 @@ make down
 
 ## Using Named Sessions
 
-Sessions are automatically persisted and can be resumed across CLI runs. Each session maintains its own conversation history in PostgreSQL.
+Sessions are automatically persisted and can be resumed across CLI runs. Each session maps to a Mem0 user (the UUID stored in your local sessions registry) and maintains its own semantic memories in Mem0/PGVector.
 
 **Anonymous sessions (no `--session` flag):**
 - Create a fresh session each time you run the CLI
@@ -103,7 +103,7 @@ make run-cli SESSION_ARGS='--session work'
 make run-cli SESSION_ARGS='--session project-x'
 ```
 
-All sessions are stored in `~/.localllm_sessions.json` and cached for fast startup (default: 300 seconds). See `cli/README.md` for detailed documentation on session management, caching, and performance.
+All sessions are stored in `~/.localllm_sessions.json` and cached for fast startup (default: 300 seconds). These UUIDs are used as Mem0 user IDs on the server. See `cli/README.md` for detailed documentation on session management, caching, and performance.
 
 ### Stopping the Services
 
@@ -130,10 +130,11 @@ Configured via environment variables in a `.env` file. Copy `.env.example` to ge
 
 - `OLLAMA_BASE_URL` — Base URL for the Ollama API (default: `http://127.0.0.1:11434`).
 
-### PostgreSQL
+### PostgreSQL / Mem0 PGVector
 
 - `PG_HOST`, `PG_PORT`, `PG_DATABASE`, `PG_USER`, `PG_PASSWORD` — database connection details.
 - `PG_COLLECTION_NAME` — table name for pgvector embeddings (used by RAG pipeline).
+- `MEM0_COLLECTION_NAME` — collection name used by Mem0 to store chat memories in the same Postgres/PGVector instance.
 
 ### RAG Pipeline
 

@@ -27,17 +27,29 @@ class Settings(SharedSettings):
         default="custom-chatbot-model",
         alias="SERVER_OLLAMA_MODEL",
     )
-
-    # Conversation history management
-    server_max_recent: int = Field(
-        default=10,
-        alias="SERVER_MAX_RECENT",
-        description="Number of recent messages to retain verbatim before summarisation.",
+    server_ollama_num_ctx: int = Field(
+        default=8192,
+        alias="SERVER_OLLAMA_NUM_CTX",
+        description="Context window size passed to Ollama on every chat call.",
     )
-    server_threshold: int = Field(
-        default=20,
-        alias="SERVER_THRESHOLD",
-        description="Total message count at which history summarisation is triggered.",
+
+    # Memory retrieval
+    server_memory_window_size: int = Field(
+        default=10,
+        alias="SERVER_MEMORY_WINDOW_SIZE",
+        description=(
+            "Number of verbatim turns (user + assistant messages) kept in the "
+            "sliding window persisted in PostgreSQL. Older turns are discarded. "
+            "Replaces the old SERVER_MEMORY_MAX_MESSAGES setting."
+        ),
+    )
+    server_memory_long_term_max: int = Field(
+        default=3,
+        alias="SERVER_MEMORY_LONG_TERM_MAX",
+        description=(
+            "Maximum number of Mem0 long-term memory entries injected as system "
+            "messages at the top of the context on every turn."
+        ),
     )
 
     # RAG retrieval

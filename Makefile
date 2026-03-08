@@ -14,7 +14,7 @@ run-rag:
 	uv run --package rag python -m rag.main
 
 test:
-	uv run pytest
+	uv run pytest -v
 
 down:
 	docker compose down
