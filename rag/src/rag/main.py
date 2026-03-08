@@ -6,6 +6,7 @@ import re
 from pathlib import Path
 
 import httpx
+import trafilatura
 from bs4 import BeautifulSoup
 from langchain_core.documents import Document
 from langchain_experimental.text_splitter import SemanticChunker
@@ -101,16 +102,25 @@ async def scrape_url(
 def extract_text_from_html(html: str) -> str | None:
     """Parse HTML and return cleaned plain text, or None if no text was found.
 
-    Falls back from <main> → <body> → the whole document when selecting the
-    primary content block. Collapses whitespace and normalises newlines.
+    Uses ``trafilatura`` for main-content extraction, which filters out
+    navigation bars, footers, ads, and other boilerplate automatically.
+    Falls back to a BeautifulSoup heuristic (<main> → <body> → document) if
+    trafilatura returns nothing, then collapses whitespace and normalises
+    newlines on the result.
     """
+    # Primary path: trafilatura gives much cleaner article/main-content text.
+    extracted = trafilatura.extract(html, include_comments=False, include_tables=True)
+    if extracted:
+        cleaned = re.sub(r"[ \t]+", " ", extracted)
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+        return cleaned.strip() or None
+
+    # Fallback: BeautifulSoup heuristic for pages trafilatura cannot parse.
     soup = BeautifulSoup(html, "html.parser")
     content_block = soup.main or soup.body or soup
     raw_text = content_block.get_text(separator="\n", strip=True)
 
-    # Collapse runs of spaces/tabs into a single space
     cleaned = re.sub(r"[ \t]+", " ", raw_text)
-    # Normalise 3+ consecutive newlines into a standard paragraph break
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     cleaned = cleaned.strip()
 
@@ -171,7 +181,12 @@ async def process_item(
 
     # 1. Skip already-processed URLs
     try:
-        if pgvector_store.similarity_search(query=" ", filter={"source": url}):
+        existing = pgvector_store.similarity_search(
+            query="",
+            k=1,
+            filter={"source": url},
+        )
+        if existing:
             logger.info("Already processed, skipping: %s", url)
             return
     except Exception as e:
@@ -213,10 +228,18 @@ async def process_item(
 async def producer(
     queue: asyncio.Queue,
     reading_list: list[dict],
+    num_consumers: int,
 ) -> None:
-    """Enqueue all reading-list items for the consumers to process."""
+    """Enqueue all reading-list items, then send one sentinel per consumer.
+
+    Sending one ``None`` sentinel per consumer guarantees that every worker
+    receives exactly one shutdown signal and exits cleanly without needing
+    to be cancelled from outside.
+    """
     for item in reading_list:
         await queue.put(item)
+    for _ in range(num_consumers):
+        await queue.put(None)  # poison pill
 
 
 async def consumer(
@@ -225,14 +248,20 @@ async def consumer(
     embeddings: OllamaEmbeddings,
     semaphore: asyncio.Semaphore,
 ) -> None:
-    """Consume items from the queue until cancelled.
+    """Consume items from the queue until a ``None`` sentinel is received.
 
-    Unexpected errors are logged and the current item is skipped so that
-    the worker remains alive for subsequent items.
+    A ``None`` value is the poison-pill shutdown signal written by the producer
+    after all real items have been enqueued.  Unexpected errors are logged and
+    the current item is skipped so that the worker remains alive for subsequent
+    items.
     """
     while True:
         try:
             item = await queue.get()
+            if item is None:
+                # Poison pill — this worker is done.
+                queue.task_done()
+                break
             await process_item(
                 item,
                 pgvector_store,
@@ -241,8 +270,6 @@ async def consumer(
                 settings.request_delay,
             )
             queue.task_done()
-        except asyncio.CancelledError:
-            break
         except Exception:
             logger.exception("Unexpected error processing item — skipping.")
             queue.task_done()
@@ -293,19 +320,18 @@ async def run_pipeline(data_path: Path) -> None:
 
     semaphore = asyncio.Semaphore(settings.concurrent_requests)
     queue: asyncio.Queue = asyncio.Queue()
+    num_consumers = settings.concurrent_requests
 
-    producer_task = asyncio.create_task(producer(queue, reading_list))
+    producer_task = asyncio.create_task(producer(queue, reading_list, num_consumers))
     consumer_tasks = [
         asyncio.create_task(consumer(queue, pgvector_store, embeddings, semaphore))
-        for _ in range(settings.concurrent_requests)
+        for _ in range(num_consumers)
     ]
 
     await producer_task
     await queue.join()
-
-    for task in consumer_tasks:
-        task.cancel()
-    await asyncio.gather(*consumer_tasks, return_exceptions=True)
+    # Consumers exit cleanly on their own poison-pill sentinels; just await them.
+    await asyncio.gather(*consumer_tasks)
 
     logger.info("Pipeline complete.")
 
