@@ -3,6 +3,7 @@ import json
 import sys
 
 import httpx
+from httpx_sse import connect_sse
 
 from cli.config import settings
 from cli.services import get_or_create_session
@@ -33,54 +34,44 @@ class ChatApplication:
         """Send user_input to the server and stream the response to stdout."""
         url = f"{settings.server_url}/sessions/{self.session_id}/chat"
 
-        with self.client.stream(
+        rag_doc_count: int | None = None
+        print(f"\n{Colors.CYAN}{Colors.BOLD}Assistant:{Colors.RESET}")
+
+        with connect_sse(
+            self.client,
             "POST",
             url,
             json={"message": user_input},
             timeout=None,
-        ) as response:
-            if response.status_code != 200:
-                print(f"Server error {response.status_code}: {response.text}")
+        ) as event_source:
+            if event_source.response.status_code != 200:
+                # Truncate the body to avoid leaking server-side stack traces
+                # or configuration details to the terminal.
+                # .read() must be called explicitly because the response is
+                # opened as a stream and .text is not available until buffered.
+                event_source.response.read()
+                raw = event_source.response.text[:200]
+                print(f"Server error {event_source.response.status_code}: {raw}")
                 return
 
-            rag_doc_count: int | None = None
-            print(f"\n{Colors.CYAN}{Colors.BOLD}Assistant:{Colors.RESET}")
+            for sse in event_source.iter_sse():
+                if sse.event == "token":
+                    print(sse.data, end="", flush=True)
+                elif sse.event == "rag":
+                    rag_doc_count = json.loads(sse.data)["document_count"]
+                elif sse.event == "error":
+                    print(f"\nServer error: {sse.data}")
+                    break
+                elif sse.event == "done":
+                    break
 
-            # SSE frames arrive as pairs of "event: <name>" / "data: <value>"
-            # lines separated by blank lines.  Track current event name so
-            # that the data handler always has a valid event to act on.
-            current_event: str = "message"
-            for line in response.iter_lines():
-                if not line:
-                    current_event = "message"
-                    continue
+        print("\n")
 
-                if line.startswith("event:"):
-                    current_event = line[len("event:") :].strip()
-                elif line.startswith("data:"):
-                    # Strip exactly one optional separator space after "data:"
-                    # so that "data: foo" and "data:foo" both yield "foo",
-                    # while "data:  two spaces" yields " two spaces".
-                    raw = line[len("data:") :]
-                    data = raw[1:] if raw.startswith(" ") else raw
-
-                    if current_event == "token":
-                        print(data, end="", flush=True)
-                    elif current_event == "rag":
-                        rag_doc_count = json.loads(data)["document_count"]
-                    elif current_event == "error":
-                        print(f"\nServer error: {data}")
-                        break
-                    elif current_event == "done":
-                        break
-
-            print("\n")
-
-            if rag_doc_count is not None:
-                print(
-                    f"{Colors.CYAN}(RAG: retrieved context from "
-                    f"{rag_doc_count} document(s)){Colors.RESET}\n"
-                )
+        if rag_doc_count is not None:
+            print(
+                f"{Colors.CYAN}(RAG: retrieved context from "
+                f"{rag_doc_count} document(s)){Colors.RESET}\n"
+            )
 
     def run(self) -> None:
         """Run the interactive chat REPL until the user exits."""

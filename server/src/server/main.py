@@ -10,8 +10,8 @@ from sse_starlette.sse import EventSourceResponse
 
 from server.chat import ChatSession
 from server.config import settings
-from server.db import create_session, load_messages, session_exists
-from server.services import EngineDep, OllamaClientDep, RagStoreDep, lifespan
+from server.memory import create_session, load_messages, session_exists
+from server.services import Mem0Dep, OllamaClientDep, PgDsnDep, RagStoreDep, lifespan
 
 logger = logging.getLogger(__name__)
 
@@ -37,32 +37,32 @@ class ChatRequest(BaseModel):
 
 
 @app.post("/sessions", response_model=CreateSessionResponse, status_code=201)
-def create_new_session(engine: EngineDep) -> CreateSessionResponse:
+def create_new_session(pg_dsn: PgDsnDep) -> CreateSessionResponse:
     """Create a new conversation session and return its ID."""
-    session_id = create_session(engine)
+    session_id = create_session(pg_dsn)
     logger.info("Created session %s.", session_id)
     return CreateSessionResponse(session_id=session_id)
 
 
 @app.head("/sessions/{session_id}", status_code=200)
-def check_session_exists(session_id: uuid.UUID, engine: EngineDep) -> None:
-    """Check whether a session exists without loading its messages.
+def check_session_exists(session_id: uuid.UUID, pg_dsn: PgDsnDep) -> None:
+    """Check whether a session exists without loading its memories.
 
     Returns 200 if found, 404 if not.  Used by the CLI at startup to validate
     a cached session ID without paying the cost of fetching full history.
     """
-    if not session_exists(engine, session_id):
+    if not session_exists(pg_dsn, session_id):
         raise HTTPException(status_code=404, detail="Session not found.")
 
 
 @app.get("/sessions/{session_id}", response_model=SessionHistoryResponse)
 def get_session_history(
-    session_id: uuid.UUID, engine: EngineDep
+    session_id: uuid.UUID, mem0: Mem0Dep, pg_dsn: PgDsnDep
 ) -> SessionHistoryResponse:
-    """Return the full message history for an existing session."""
-    if not session_exists(engine, session_id):
+    """Return the stored memories for an existing session."""
+    if not session_exists(pg_dsn, session_id):
         raise HTTPException(status_code=404, detail="Session not found.")
-    messages = load_messages(engine, session_id)
+    messages = load_messages(mem0, session_id, query="")
     return SessionHistoryResponse(
         session_id=session_id,
         messages=[MessageResponse(**m) for m in messages],
@@ -73,9 +73,10 @@ def get_session_history(
 def chat(
     session_id: uuid.UUID,
     body: ChatRequest,
-    engine: EngineDep,
+    mem0: Mem0Dep,
     ollama_client: OllamaClientDep,
     rag_store: RagStoreDep,
+    pg_dsn: PgDsnDep,
 ) -> EventSourceResponse:
     """Send a message and stream the assistant response as SSE.
 
@@ -85,13 +86,15 @@ def chat(
                      retrieved context).
       - ``done``   — signals the end of the stream (data: "[DONE]").
       - ``error``  — sent if an exception occurs mid-stream.
-    """    if not session_exists(engine, session_id):
+    """
+    if not session_exists(pg_dsn, session_id):
         raise HTTPException(status_code=404, detail="Session not found.")
 
     session = ChatSession(
         session_id=session_id,
-        engine=engine,
+        mem0=mem0,
         ollama_client=ollama_client,
+        pg_dsn=pg_dsn,
         pgvector_store=rag_store,
     )
 
