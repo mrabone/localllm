@@ -23,7 +23,7 @@ RUN uv build --wheel --out-dir /tmp/wheels ./common \
 
 
 # Runtime stage: Minimal image with only installed packages
-FROM python:3.12-slim
+FROM python:3.12-slim AS runtime
 
 WORKDIR /app
 
@@ -34,5 +34,27 @@ COPY --from=builder /opt/venv /opt/venv
 # Add the installed packages to Python path so they can be imported
 ENV PYTHONPATH=/opt/venv \
     PYTHONUNBUFFERED=1
+
+CMD ["python", "-m", "server.main"]
+
+
+# Dev stage: dependencies pre-installed; source is supplied via bind mounts at
+# run time so code changes are reflected immediately without a rebuild.
+# Installs into site-packages (not --target) so .pth files are processed and
+# editable installs resolve correctly.
+FROM python:3.12-slim AS dev
+
+WORKDIR /app
+
+RUN pip install uv
+
+COPY pyproject.toml uv.lock* ./
+COPY common/ common/
+COPY server/ server/
+
+RUN uv pip install --python /usr/local/bin/python --system \
+    ./common ./server
+
+ENV PYTHONUNBUFFERED=1
 
 CMD ["python", "-m", "server.main"]

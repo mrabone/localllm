@@ -13,8 +13,6 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Mem0 response normalisation helpers
 # ---------------------------------------------------------------------------
-
-
 def _normalise_mem0_results(results: Any) -> list[dict]:
     """Unwrap the Mem0 API response into a plain list of memory dicts.
 

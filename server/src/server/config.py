@@ -21,6 +21,7 @@ class Settings(SharedSettings):
     # HTTP server
     server_host: str = Field(default="0.0.0.0", alias="SERVER_HOST")
     server_port: int = Field(default=8000, alias="SERVER_PORT")
+    server_reload: bool = Field(default=False, alias="SERVER_RELOAD")
 
     # Chat model
     server_ollama_model: str = Field(
