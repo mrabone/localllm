@@ -23,6 +23,13 @@ class Settings(SharedSettings):
     server_port: int = Field(default=8000, alias="SERVER_PORT")
     server_reload: bool = Field(default=False, alias="SERVER_RELOAD")
 
+    # MCP server connection
+    mcp_server_url: str = Field(
+        default="http://127.0.0.1:8001",
+        alias="MCP_SERVER_URL",
+        description="Base URL of the MCP server that owns RAG and memory tools.",
+    )
+
     # Chat model
     server_ollama_model: str = Field(
         default="custom-chatbot-model",
@@ -51,19 +58,6 @@ class Settings(SharedSettings):
             "Maximum number of Mem0 long-term memory entries injected as system "
             "messages at the top of the context on every turn."
         ),
-    )
-
-    # RAG retrieval
-    server_enable_rag: bool = Field(default=False, alias="SERVER_ENABLE_RAG")
-    server_rag_k: int = Field(
-        default=3,
-        alias="SERVER_RAG_K",
-        description="Number of candidate documents to retrieve from PGVector.",
-    )
-    server_rag_max_distance: float = Field(
-        default=0.5,
-        alias="SERVER_RAG_MAX_DISTANCE",
-        description="Maximum cosine distance for a retrieved document to be included in context.",
     )
 
 

@@ -43,6 +43,18 @@ class SharedSettings(BaseSettings):
         alias="MEM0_COLLECTION_NAME",
     )
 
+    # RAG retrieval — shared by the MCP server and any other consumer
+    rag_k: int = Field(
+        default=3,
+        alias="RAG_K",
+        description="Number of candidate documents to retrieve from PGVector.",
+    )
+    rag_max_distance: float = Field(
+        default=0.5,
+        alias="RAG_MAX_DISTANCE",
+        description="Maximum cosine distance for a retrieved document to be included in context.",
+    )
+
     @property
     def db_url(self) -> URL:
         """Construct a SQLAlchemy URL object for the PostgreSQL connection.

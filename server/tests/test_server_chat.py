@@ -1,342 +1,378 @@
+import json
 import uuid
-from concurrent.futures import Future
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 from server.chat import ChatSession, Role
 
-_FAKE_DSN = "host=localhost dbname=test"
+
+def _make_tool_result(text: str):
+    """Return a mock MCP call_tool result with a single text content item."""
+    content_item = MagicMock()
+    content_item.text = text
+    result = MagicMock()
+    result.content = [content_item]
+    return result
 
 
-class _ImmediateExecutor:
-    """Minimal executor stub that runs submitted callables synchronously.
-
-    Used in tests that need to assert on the results of fire-and-forget
-    background tasks (e.g. assistant-turn Mem0 persistence) without
-    introducing timing non-determinism.
-    """
-
-    def submit(self, fn, *args, **kwargs) -> Future:
-        f: Future = Future()
-        try:
-            result = fn(*args, **kwargs)
-            f.set_result(result)
-        except Exception as exc:
-            f.set_exception(exc)
-        return f
+def _make_empty_tool_result():
+    """Return a mock MCP call_tool result with no content."""
+    result = MagicMock()
+    result.content = []
+    return result
 
 
 def _make_session(**kwargs) -> ChatSession:
-    """Return a ChatSession with mock dependencies.
-
-    Injects an ``_ImmediateExecutor`` by default so that background tasks
-    (e.g. fire-and-forget Mem0 saves) complete synchronously within tests.
-    """
-    kwargs.setdefault("executor", _ImmediateExecutor())
+    """Return a ChatSession with mock MCP and Ollama dependencies."""
+    mcp_session = AsyncMock()
+    mcp_session.call_tool = AsyncMock(return_value=_make_tool_result(""))
+    ollama_client = MagicMock()
     return ChatSession(
-        session_id=uuid.uuid4(),
-        mem0=MagicMock(),
-        ollama_client=MagicMock(),
-        pg_dsn=_FAKE_DSN,
-        pgvector_store=None,
+        session_id=kwargs.pop("session_id", uuid.uuid4()),
+        mcp_session=kwargs.pop("mcp_session", mcp_session),
+        ollama_client=kwargs.pop("ollama_client", ollama_client),
         **kwargs,
     )
 
 
-class TestChat:
-    def test_saves_user_and_assistant_messages_to_mem0_and_window(self):
-        """Both save_message (Mem0) and append_turn (window) are called for each turn."""
+def _stub_call_tool(tool_responses: dict):
+    """Return an AsyncMock for call_tool that dispatches by tool name.
+
+    Args:
+        tool_responses: Mapping of tool name -> text string to return.
+                        Missing keys default to an empty string result.
+    """
+
+    async def _call_tool(name, *, arguments=None, **kwargs):
+        text = tool_responses.get(name, "")
+        if text == "":
+            return _make_empty_tool_result()
+        return _make_tool_result(text)
+
+    return AsyncMock(side_effect=_call_tool)
+
+
+@pytest.mark.asyncio
+class TestChatTokenStream:
+    async def test_stream_yields_tokens(self):
+        """Tokens from ollama_client.chat() are yielded in order."""
         session = _make_session()
-
-        with (
-            patch("server.chat.load_long_term_memories", return_value=[]),
-            patch("server.chat.load_window", return_value=[]),
-            patch("server.chat.save_message") as mock_save,
-            patch("server.chat.append_turn") as mock_append,
-            patch("server.chat.get_rag_context", return_value=None),
-        ):
-            session.client.chat.return_value = iter([{"message": {"content": "hi"}}])
-            token_stream, _ = session.chat("hello")
-            list(token_stream)
-
-        assert mock_save.call_count == 2
-        assert mock_save.call_args_list[0] == call(
-            session.mem0, session.session_id, Role.USER.value, "hello"
-        )
-        assert mock_save.call_args_list[1] == call(
-            session.mem0, session.session_id, Role.ASSISTANT.value, "hi"
+        session.mcp_session.call_tool = _stub_call_tool({})
+        session.client.chat.return_value = iter(
+            [
+                {"message": {"content": "Hello"}},
+                {"message": {"content": " world"}},
+            ]
         )
 
-        assert mock_append.call_count == 2
-        assert mock_append.call_args_list[0] == call(
-            _FAKE_DSN, session.session_id, Role.USER.value, "hello"
-        )
-        assert mock_append.call_args_list[1] == call(
-            _FAKE_DSN, session.session_id, Role.ASSISTANT.value, "hi"
-        )
-
-    def test_returns_none_rag_result_when_rag_disabled(self):
-        session = _make_session()
-
-        with (
-            patch("server.chat.load_long_term_memories", return_value=[]),
-            patch("server.chat.load_window", return_value=[]),
-            patch("server.chat.save_message"),
-            patch("server.chat.append_turn"),
-            patch("server.chat.get_rag_context", return_value=None),
-        ):
-            session.client.chat.return_value = iter([{"message": {"content": ""}}])
-            _, rag_result = session.chat("hi")
-
-        assert rag_result is None
-
-    def test_enriches_prompt_when_rag_returns_context(self):
-        """RAG context is injected as a dedicated system message, not into the user turn."""
-        from server.rag import RagResult
-
-        session = ChatSession(
-            session_id=uuid.uuid4(),
-            mem0=MagicMock(),
-            ollama_client=MagicMock(),
-            pg_dsn=_FAKE_DSN,
-            pgvector_store=MagicMock(),
-        )
-        mock_rag_result = RagResult(context="some context", document_count=2)
-
-        with (
-            patch("server.chat.load_long_term_memories", return_value=[]),
-            patch("server.chat.load_window", return_value=[]),
-            patch("server.chat.save_message"),
-            patch("server.chat.append_turn"),
-            patch("server.chat.get_rag_context", return_value=mock_rag_result),
-            patch(
-                "server.chat.build_rag_system_message", return_value="rag system msg"
-            ) as mock_build,
-        ):
-            session.client.chat.return_value = iter(
-                [{"message": {"content": "answer"}}]
-            )
-            token_stream, rag_result = session.chat("original question")
-            list(token_stream)
-
-        mock_build.assert_called_once_with("some context")
-        assert rag_result is mock_rag_result
-
-        call_kwargs = session.client.chat.call_args[1]
-        messages = call_kwargs["messages"]
-        roles = [m["role"] for m in messages]
-        assert roles.count("system") >= 2
-        rag_msg = next(m for m in messages if m["content"] == "rag system msg")
-        assert rag_msg["role"] == "system"
-        assert messages[-1] == {"role": "user", "content": "original question"}
-
-    def test_stream_yields_tokens(self):
-        session = _make_session()
-
-        with (
-            patch("server.chat.load_long_term_memories", return_value=[]),
-            patch("server.chat.load_window", return_value=[]),
-            patch("server.chat.save_message"),
-            patch("server.chat.append_turn"),
-            patch("server.chat.get_rag_context", return_value=None),
-        ):
-            session.client.chat.return_value = iter(
-                [
-                    {"message": {"content": "Hello"}},
-                    {"message": {"content": " world"}},
-                ]
-            )
-            token_stream, _ = session.chat("hi")
-            tokens = list(token_stream)
+        stream, _ = await session.chat("hi")
+        tokens = [t async for t in stream]
 
         assert tokens == ["Hello", " world"]
 
-    def test_two_tier_context_order(self):
-        """Context passed to Ollama must be:
-        orientation + long_term + window + [current_turn].
-        RAG is absent here (no pgvector store); orientation is always first.
-        """
+    async def test_rag_used_false_when_search_returns_empty(self):
+        """rag_used is False when search_knowledge_base returns an empty string."""
         session = _make_session()
+        session.mcp_session.call_tool = _stub_call_tool({"search_knowledge_base": ""})
+        session.client.chat.return_value = iter([{"message": {"content": "ok"}}])
 
-        long_term = [
-            {
-                "role": "system",
-                "content": (
-                    "The following facts have been remembered from previous "
-                    "conversations with this user:\n- User is a Python developer"
-                ),
-            }
-        ]
-        window = [
+        _, rag_used = await session.chat("hello")
+
+        assert rag_used is False
+
+    async def test_rag_used_true_when_search_returns_content(self):
+        """rag_used is True when search_knowledge_base returns a non-empty string."""
+        session = _make_session()
+        session.mcp_session.call_tool = _stub_call_tool(
+            {"search_knowledge_base": "some document context"}
+        )
+        session.client.chat.return_value = iter([{"message": {"content": "ok"}}])
+
+        _, rag_used = await session.chat("hello")
+
+        assert rag_used is True
+
+
+@pytest.mark.asyncio
+class TestContextMessageOrder:
+    async def test_orientation_is_always_first(self):
+        """The orientation system message must always be the first message."""
+        session = _make_session()
+        session.mcp_session.call_tool = _stub_call_tool({})
+        session.client.chat.return_value = iter([{"message": {"content": "ok"}}])
+
+        stream, _ = await session.chat("hello")
+        async for _ in stream:
+            pass
+
+        messages = session.client.chat.call_args[1]["messages"]
+        assert messages[0]["role"] == "system"
+        assert "helpful assistant" in messages[0]["content"]
+
+    async def test_user_turn_is_last(self):
+        """The current user input must always be the final message."""
+        session = _make_session()
+        session.mcp_session.call_tool = _stub_call_tool({})
+        session.client.chat.return_value = iter([{"message": {"content": "ok"}}])
+
+        stream, _ = await session.chat("my question")
+        async for _ in stream:
+            pass
+
+        messages = session.client.chat.call_args[1]["messages"]
+        assert messages[-1] == {"role": "user", "content": "my question"}
+
+    async def test_no_extra_messages_when_context_empty(self):
+        """With no long-term memory, no window, and no RAG: orientation + user = 2 messages."""
+        session = _make_session()
+        session.mcp_session.call_tool = _stub_call_tool({})
+        session.client.chat.return_value = iter([{"message": {"content": "ok"}}])
+
+        stream, _ = await session.chat("hello")
+        async for _ in stream:
+            pass
+
+        messages = session.client.chat.call_args[1]["messages"]
+        assert len(messages) == 2
+        assert messages[0]["role"] == "system"
+        assert messages[1] == {"role": "user", "content": "hello"}
+
+    async def test_long_term_memory_injected_after_orientation(self):
+        """Long-term memory system message comes immediately after the orientation."""
+        session = _make_session()
+        session.mcp_session.call_tool = _stub_call_tool(
+            {"load_long_term_memory": "User is a Python developer"}
+        )
+        session.client.chat.return_value = iter([{"message": {"content": "ok"}}])
+
+        stream, _ = await session.chat("hello")
+        async for _ in stream:
+            pass
+
+        messages = session.client.chat.call_args[1]["messages"]
+        assert messages[1] == {
+            "role": "system",
+            "content": "User is a Python developer",
+        }
+
+    async def test_window_turns_inserted_after_long_term(self):
+        """Window turns (parsed from JSON) are inserted after long-term memory."""
+        window_turns = [
             {"role": "user", "content": "prev question"},
             {"role": "assistant", "content": "prev answer"},
         ]
+        session = _make_session()
+        session.mcp_session.call_tool = _stub_call_tool(
+            {
+                "load_long_term_memory": "some memory",
+                "load_conversation_window": json.dumps(window_turns),
+            }
+        )
+        session.client.chat.return_value = iter([{"message": {"content": "ok"}}])
 
-        with (
-            patch("server.chat.load_long_term_memories", return_value=long_term),
-            patch("server.chat.load_window", return_value=window),
-            patch("server.chat.save_message"),
-            patch("server.chat.append_turn"),
-            patch("server.chat.get_rag_context", return_value=None),
-        ):
-            session.client.chat.return_value = iter([{"message": {"content": "ok"}}])
-            token_stream, _ = session.chat("current question")
-            list(token_stream)
+        stream, _ = await session.chat("current question")
+        async for _ in stream:
+            pass
 
-        call_kwargs = session.client.chat.call_args[1]
-        messages = call_kwargs["messages"]
-
-        assert messages[0]["role"] == "system"
-        assert "helpful assistant" in messages[0]["content"]
-
-        assert messages[1] == long_term[0]
-
+        messages = session.client.chat.call_args[1]["messages"]
         assert messages[2] == {"role": "user", "content": "prev question"}
         assert messages[3] == {"role": "assistant", "content": "prev answer"}
 
-        assert messages[4] == {"role": "user", "content": "current question"}
-
-        assert len(messages) == 5
-
-    def test_long_term_memories_fetched_with_configured_max(self):
-        """load_long_term_memories is called with server_memory_long_term_max."""
+    async def test_rag_system_message_injected_before_user_turn(self):
+        """RAG context appears as a system message immediately before the user turn."""
         session = _make_session()
-
-        with (
-            patch("server.chat.load_long_term_memories", return_value=[]) as mock_lt,
-            patch("server.chat.load_window", return_value=[]),
-            patch("server.chat.save_message"),
-            patch("server.chat.append_turn"),
-            patch("server.chat.get_rag_context", return_value=None),
-            patch("server.chat.settings") as mock_settings,
-        ):
-            mock_settings.server_ollama_model = "test-model"
-            mock_settings.server_ollama_num_ctx = 8192
-            mock_settings.server_memory_long_term_max = 3
-            mock_settings.server_memory_window_size = 10
-            session.client.chat.return_value = iter([{"message": {"content": "ok"}}])
-            token_stream, _ = session.chat("hello")
-            list(token_stream)
-
-        mock_lt.assert_called_once_with(
-            session.mem0, session.session_id, long_term_max=3
+        session.mcp_session.call_tool = _stub_call_tool(
+            {"search_knowledge_base": "relevant doc content"}
         )
+        session.client.chat.return_value = iter([{"message": {"content": "ok"}}])
 
-    def test_window_fetched_with_configured_size(self):
-        """load_window is called with server_memory_window_size."""
+        stream, _ = await session.chat("my question")
+        async for _ in stream:
+            pass
+
+        messages = session.client.chat.call_args[1]["messages"]
+        assert messages[-1] == {"role": "user", "content": "my question"}
+        rag_msg = messages[-2]
+        assert rag_msg["role"] == "system"
+        assert "relevant doc content" in rag_msg["content"]
+
+    async def test_full_context_order(self):
+        """Full order: orientation → long_term → window → rag system msg → user."""
+        window_turns = [
+            {"role": "user", "content": "prev q"},
+            {"role": "assistant", "content": "prev a"},
+        ]
         session = _make_session()
+        session.mcp_session.call_tool = _stub_call_tool(
+            {
+                "load_long_term_memory": "memory facts",
+                "load_conversation_window": json.dumps(window_turns),
+                "search_knowledge_base": "rag docs",
+            }
+        )
+        session.client.chat.return_value = iter([{"message": {"content": "ok"}}])
 
-        with (
-            patch("server.chat.load_long_term_memories", return_value=[]),
-            patch("server.chat.load_window", return_value=[]) as mock_win,
-            patch("server.chat.save_message"),
-            patch("server.chat.append_turn"),
-            patch("server.chat.get_rag_context", return_value=None),
-            patch("server.chat.settings") as mock_settings,
-        ):
-            mock_settings.server_ollama_model = "test-model"
-            mock_settings.server_ollama_num_ctx = 8192
-            mock_settings.server_memory_long_term_max = 3
-            mock_settings.server_memory_window_size = 10
-            session.client.chat.return_value = iter([{"message": {"content": "ok"}}])
-            token_stream, _ = session.chat("hello")
-            list(token_stream)
+        stream, _ = await session.chat("current q")
+        async for _ in stream:
+            pass
 
-        mock_win.assert_called_once_with(_FAKE_DSN, session.session_id, window_size=10)
-
-    def test_num_ctx_is_passed_to_ollama(self):
-        """client.chat() must receive num_ctx in its options."""
-        session = _make_session()
-
-        with (
-            patch("server.chat.load_long_term_memories", return_value=[]),
-            patch("server.chat.load_window", return_value=[]),
-            patch("server.chat.save_message"),
-            patch("server.chat.append_turn"),
-            patch("server.chat.get_rag_context", return_value=None),
-            patch("server.chat.settings") as mock_settings,
-        ):
-            mock_settings.server_ollama_model = "test-model"
-            mock_settings.server_ollama_num_ctx = 8192
-            mock_settings.server_memory_long_term_max = 3
-            mock_settings.server_memory_window_size = 10
-            session.client.chat.return_value = iter([{"message": {"content": "ok"}}])
-            token_stream, _ = session.chat("hello")
-            list(token_stream)
-
-        call_kwargs = session.client.chat.call_args[1]
-        assert call_kwargs.get("options", {}).get("num_ctx") == 8192
-
-    def test_rag_injected_as_system_message_before_user_turn(self):
-        """When RAG returns results the context must appear as a system message
-        immediately before the final user turn, and the user turn must contain
-        the clean question only."""
-        from server.rag import RagResult
-
-        session = _make_session()
-        mock_rag_result = RagResult(context="doc content", document_count=1)
-
-        with (
-            patch("server.chat.load_long_term_memories", return_value=[]),
-            patch("server.chat.load_window", return_value=[]),
-            patch("server.chat.save_message"),
-            patch("server.chat.append_turn"),
-            patch("server.chat.get_rag_context", return_value=mock_rag_result),
-            patch(
-                "server.chat.build_rag_system_message",
-                return_value="kb: doc content",
-            ),
-        ):
-            session.client.chat.return_value = iter([{"message": {"content": "ok"}}])
-            token_stream, _ = session.chat("my question")
-            list(token_stream)
-
-        call_kwargs = session.client.chat.call_args[1]
-        messages = call_kwargs["messages"]
-
-        assert len(messages) == 3
-        assert messages[0]["role"] == "system"
-        assert messages[1] == {"role": "system", "content": "kb: doc content"}
-        assert messages[2] == {"role": "user", "content": "my question"}
-
-    def test_no_rag_message_when_rag_disabled(self):
-        """When RAG is disabled (no pgvector store) no RAG system message is present."""
-        session = _make_session()
-
-        with (
-            patch("server.chat.load_long_term_memories", return_value=[]),
-            patch("server.chat.load_window", return_value=[]),
-            patch("server.chat.save_message"),
-            patch("server.chat.append_turn"),
-            patch("server.chat.get_rag_context", return_value=None),
-        ):
-            session.client.chat.return_value = iter([{"message": {"content": "ok"}}])
-            token_stream, _ = session.chat("my question")
-            list(token_stream)
-
-        call_kwargs = session.client.chat.call_args[1]
-        messages = call_kwargs["messages"]
-
-        assert len(messages) == 2
-        assert messages[0]["role"] == "system"
-        assert messages[1] == {"role": "user", "content": "my question"}
-
-    def test_orientation_message_is_always_first(self):
-        """The orientation system message must always be the first message,
-        even when there are no long-term memories and no RAG results."""
-        session = _make_session()
-
-        with (
-            patch("server.chat.load_long_term_memories", return_value=[]),
-            patch("server.chat.load_window", return_value=[]),
-            patch("server.chat.save_message"),
-            patch("server.chat.append_turn"),
-            patch("server.chat.get_rag_context", return_value=None),
-        ):
-            session.client.chat.return_value = iter([{"message": {"content": "ok"}}])
-            token_stream, _ = session.chat("hello")
-            list(token_stream)
-
-        call_kwargs = session.client.chat.call_args[1]
-        messages = call_kwargs["messages"]
+        messages = session.client.chat.call_args[1]["messages"]
         assert messages[0]["role"] == "system"
         assert "helpful assistant" in messages[0]["content"]
+        assert messages[1] == {"role": "system", "content": "memory facts"}
+        assert messages[2] == {"role": "user", "content": "prev q"}
+        assert messages[3] == {"role": "assistant", "content": "prev a"}
+        assert messages[4]["role"] == "system"
+        assert "rag docs" in messages[4]["content"]
+        assert messages[5] == {"role": "user", "content": "current q"}
+        assert len(messages) == 6
+
+
+@pytest.mark.asyncio
+class TestMcpToolCallArgs:
+    async def test_load_long_term_memory_called_with_configured_max(self):
+        """load_long_term_memory is called with the session id and long_term_max."""
+        session = _make_session()
+        call_tool_mock = _stub_call_tool({})
+        session.mcp_session.call_tool = call_tool_mock
+        session.client.chat.return_value = iter([{"message": {"content": "ok"}}])
+
+        with patch("server.chat.settings") as mock_settings:
+            mock_settings.server_ollama_model = "test-model"
+            mock_settings.server_ollama_num_ctx = 8192
+            mock_settings.server_memory_long_term_max = 5
+            mock_settings.server_memory_window_size = 10
+            stream, _ = await session.chat("hello")
+            async for _ in stream:
+                pass
+
+        calls_by_name = {c.args[0]: c for c in call_tool_mock.await_args_list}
+        lt_call = calls_by_name["load_long_term_memory"]
+        assert lt_call.kwargs["arguments"]["long_term_max"] == 5
+        assert lt_call.kwargs["arguments"]["session_id"] == str(session.session_id)
+
+    async def test_load_conversation_window_called_with_configured_size(self):
+        """load_conversation_window is called with the session id and window_size."""
+        session = _make_session()
+        call_tool_mock = _stub_call_tool({})
+        session.mcp_session.call_tool = call_tool_mock
+        session.client.chat.return_value = iter([{"message": {"content": "ok"}}])
+
+        with patch("server.chat.settings") as mock_settings:
+            mock_settings.server_ollama_model = "test-model"
+            mock_settings.server_ollama_num_ctx = 8192
+            mock_settings.server_memory_long_term_max = 3
+            mock_settings.server_memory_window_size = 7
+            stream, _ = await session.chat("hello")
+            async for _ in stream:
+                pass
+
+        calls_by_name = {c.args[0]: c for c in call_tool_mock.await_args_list}
+        win_call = calls_by_name["load_conversation_window"]
+        assert win_call.kwargs["arguments"]["window_size"] == 7
+        assert win_call.kwargs["arguments"]["session_id"] == str(session.session_id)
+
+    async def test_num_ctx_passed_to_ollama(self):
+        """client.chat() must receive num_ctx in its options dict."""
+        session = _make_session()
+        session.mcp_session.call_tool = _stub_call_tool({})
+        session.client.chat.return_value = iter([{"message": {"content": "ok"}}])
+
+        with patch("server.chat.settings") as mock_settings:
+            mock_settings.server_ollama_model = "test-model"
+            mock_settings.server_ollama_num_ctx = 4096
+            mock_settings.server_memory_long_term_max = 3
+            mock_settings.server_memory_window_size = 10
+            stream, _ = await session.chat("hello")
+            async for _ in stream:
+                pass
+
+        call_kwargs = session.client.chat.call_args[1]
+        assert call_kwargs["options"]["num_ctx"] == 4096
+
+    async def test_persist_message_called_for_user_turn(self):
+        """persist_message is called concurrently for the user turn before streaming."""
+        session = _make_session()
+        call_tool_mock = _stub_call_tool({})
+        session.mcp_session.call_tool = call_tool_mock
+        session.client.chat.return_value = iter([{"message": {"content": "ok"}}])
+
+        stream, _ = await session.chat("user input")
+        async for _ in stream:
+            pass
+
+        persist_calls = [
+            c for c in call_tool_mock.await_args_list if c.args[0] == "persist_message"
+        ]
+        user_persist = next(
+            (c for c in persist_calls if c.kwargs["arguments"]["role"] == "user"),
+            None,
+        )
+        assert user_persist is not None
+        assert user_persist.kwargs["arguments"]["content"] == "user input"
+
+    async def test_persist_message_called_for_assistant_turn_after_stream(self):
+        """persist_message is called for the assistant after the stream is consumed."""
+        session = _make_session()
+        call_tool_mock = _stub_call_tool({})
+        session.mcp_session.call_tool = call_tool_mock
+        session.client.chat.return_value = iter(
+            [
+                {"message": {"content": "Hello"}},
+                {"message": {"content": " there"}},
+            ]
+        )
+
+        stream, _ = await session.chat("hi")
+        async for _ in stream:
+            pass
+
+        persist_calls = [
+            c for c in call_tool_mock.await_args_list if c.args[0] == "persist_message"
+        ]
+        assistant_persist = next(
+            (c for c in persist_calls if c.kwargs["arguments"]["role"] == "assistant"),
+            None,
+        )
+        assert assistant_persist is not None
+        assert assistant_persist.kwargs["arguments"]["content"] == "Hello there"
+
+
+@pytest.mark.asyncio
+class TestEdgeCases:
+    async def test_malformed_window_json_is_ignored(self):
+        """If window_content is not valid JSON, it is silently skipped."""
+        session = _make_session()
+        session.mcp_session.call_tool = _stub_call_tool(
+            {"load_conversation_window": "not valid json {{"}
+        )
+        session.client.chat.return_value = iter([{"message": {"content": "ok"}}])
+
+        stream, _ = await session.chat("hello")
+        async for _ in stream:
+            pass
+
+        messages = session.client.chat.call_args[1]["messages"]
+        assert messages[-1] == {"role": "user", "content": "hello"}
+
+    async def test_persist_assistant_failure_does_not_raise(self):
+        """An error persisting the assistant message must not propagate to the caller."""
+        session = _make_session()
+
+        async def _failing_call_tool(name, *, arguments=None, **kwargs):
+            if (
+                name == "persist_message"
+                and arguments
+                and arguments.get("role") == "assistant"
+            ):
+                raise RuntimeError("db down")
+            return _make_tool_result("")
+
+        session.mcp_session.call_tool = AsyncMock(side_effect=_failing_call_tool)
+        session.client.chat.return_value = iter([{"message": {"content": "ok"}}])
+
+        stream, _ = await session.chat("hello")
+        tokens = [t async for t in stream]
+
+        assert tokens == ["ok"]

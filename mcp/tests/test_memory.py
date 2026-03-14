@@ -1,9 +1,9 @@
 import uuid
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
-from server.memory import (
+from mcp_server.memory import (
     append_turn,
     create_session,
     ensure_turns_table,
@@ -31,14 +31,14 @@ class TestCreateSession:
     def test_returns_uuid(self):
         """create_session should return a UUID object."""
         mock_conn, _ = _make_mock_conn()
-        with patch("server.memory._get_conn", return_value=mock_conn):
+        with patch("mcp_server.memory._get_conn", return_value=mock_conn):
             session_id = create_session("dsn")
         assert isinstance(session_id, uuid.UUID)
 
     def test_each_call_returns_unique_uuid(self):
         """create_session should return a different UUID each time."""
         mock_conn, _ = _make_mock_conn()
-        with patch("server.memory._get_conn", return_value=mock_conn):
+        with patch("mcp_server.memory._get_conn", return_value=mock_conn):
             session_id_1 = create_session("dsn")
             session_id_2 = create_session("dsn")
         assert session_id_1 != session_id_2
@@ -46,7 +46,7 @@ class TestCreateSession:
     def test_returned_uuid_is_valid(self):
         """The returned UUID should be valid and convertible to string."""
         mock_conn, _ = _make_mock_conn()
-        with patch("server.memory._get_conn", return_value=mock_conn):
+        with patch("mcp_server.memory._get_conn", return_value=mock_conn):
             session_id = create_session("dsn")
         str_id = str(session_id)
         assert len(str_id) == 36
@@ -55,7 +55,7 @@ class TestCreateSession:
     def test_inserts_row_into_chat_sessions(self):
         """create_session should INSERT the new UUID into chat_sessions."""
         mock_conn, mock_cur = _make_mock_conn()
-        with patch("server.memory._get_conn", return_value=mock_conn):
+        with patch("mcp_server.memory._get_conn", return_value=mock_conn):
             session_id = create_session("dsn")
         mock_cur.execute.assert_called_once()
         sql, params = mock_cur.execute.call_args[0]
@@ -70,7 +70,7 @@ class TestSessionExists:
         mock_cur.fetchone.return_value = (1,)
 
         session_id = uuid.uuid4()
-        with patch("server.memory._get_conn", return_value=mock_conn):
+        with patch("mcp_server.memory._get_conn", return_value=mock_conn):
             result = session_exists("dsn", session_id)
 
         assert result is True
@@ -81,32 +81,10 @@ class TestSessionExists:
         mock_cur.fetchone.return_value = None
 
         session_id = uuid.uuid4()
-        with patch("server.memory._get_conn", return_value=mock_conn):
+        with patch("mcp_server.memory._get_conn", return_value=mock_conn):
             result = session_exists("dsn", session_id)
 
         assert result is False
-
-    def test_returns_false_when_get_all_returns_dict_with_empty_results(self):
-        """session_exists should return False when no row is found (fetchone returns None)."""
-        mock_conn, mock_cur = _make_mock_conn()
-        mock_cur.fetchone.return_value = None
-
-        session_id = uuid.uuid4()
-        with patch("server.memory._get_conn", return_value=mock_conn):
-            result = session_exists("dsn", session_id)
-
-        assert result is False
-
-    def test_returns_true_when_get_all_returns_dict_with_populated_results(self):
-        """session_exists should return True when a row is found (fetchone returns a row)."""
-        mock_conn, mock_cur = _make_mock_conn()
-        mock_cur.fetchone.return_value = (1,)
-
-        session_id = uuid.uuid4()
-        with patch("server.memory._get_conn", return_value=mock_conn):
-            result = session_exists("dsn", session_id)
-
-        assert result is True
 
     def test_handles_exception_gracefully(self):
         """session_exists should return False if the DB raises an exception."""
@@ -116,7 +94,7 @@ class TestSessionExists:
         mock_conn.cursor.side_effect = Exception("Connection error")
 
         session_id = uuid.uuid4()
-        with patch("server.memory._get_conn", return_value=mock_conn):
+        with patch("mcp_server.memory._get_conn", return_value=mock_conn):
             result = session_exists("dsn", session_id)
 
         assert result is False
@@ -127,7 +105,7 @@ class TestSessionExists:
         mock_cur.fetchone.return_value = None
 
         session_id = uuid.uuid4()
-        with patch("server.memory._get_conn", return_value=mock_conn):
+        with patch("mcp_server.memory._get_conn", return_value=mock_conn):
             session_exists("dsn", session_id)
 
         _, params = mock_cur.execute.call_args[0]
@@ -491,7 +469,7 @@ class TestEnsureTurnsTable:
         """ensure_turns_table should execute CREATE TABLE (sessions), CREATE TABLE (turns) and CREATE INDEX statements."""
         mock_conn, mock_cur = _make_mock_conn()
 
-        with patch("server.memory._get_conn", return_value=mock_conn):
+        with patch("mcp_server.memory._get_conn", return_value=mock_conn):
             ensure_turns_table("host=localhost dbname=test")
 
         assert mock_cur.execute.call_count == 3
@@ -503,7 +481,7 @@ class TestEnsureTurnsTable:
         mock_conn.__exit__ = MagicMock(return_value=False)
         mock_conn.cursor.side_effect = Exception("DB error")
 
-        with patch("server.memory._get_conn", return_value=mock_conn):
+        with patch("mcp_server.memory._get_conn", return_value=mock_conn):
             with pytest.raises(Exception, match="DB error"):
                 ensure_turns_table("host=localhost dbname=test")
 
@@ -511,16 +489,10 @@ class TestEnsureTurnsTable:
 class TestAppendTurn:
     def test_inserts_row_with_correct_values(self):
         """append_turn should INSERT a row with session_id, role, and content."""
-        mock_conn = MagicMock()
-        mock_cur = MagicMock()
-        mock_conn.__enter__ = MagicMock(return_value=mock_conn)
-        mock_conn.__exit__ = MagicMock(return_value=False)
-        mock_cur.__enter__ = MagicMock(return_value=mock_cur)
-        mock_cur.__exit__ = MagicMock(return_value=False)
-        mock_conn.cursor.return_value = mock_cur
+        mock_conn, mock_cur = _make_mock_conn()
 
         session_id = uuid.uuid4()
-        with patch("server.memory._get_conn", return_value=mock_conn):
+        with patch("mcp_server.memory._get_conn", return_value=mock_conn):
             append_turn("dsn", session_id, "user", "hello")
 
         mock_cur.execute.assert_called_once()
@@ -536,22 +508,16 @@ class TestAppendTurn:
         mock_conn.__exit__ = MagicMock(return_value=False)
         mock_conn.cursor.side_effect = Exception("write error")
 
-        with patch("server.memory._get_conn", return_value=mock_conn):
+        with patch("mcp_server.memory._get_conn", return_value=mock_conn):
             with pytest.raises(Exception, match="write error"):
                 append_turn("dsn", uuid.uuid4(), "user", "hello")
 
     def test_converts_session_id_to_string(self):
         """append_turn should pass the session UUID as a string to the DB."""
-        mock_conn = MagicMock()
-        mock_cur = MagicMock()
-        mock_conn.__enter__ = MagicMock(return_value=mock_conn)
-        mock_conn.__exit__ = MagicMock(return_value=False)
-        mock_cur.__enter__ = MagicMock(return_value=mock_cur)
-        mock_cur.__exit__ = MagicMock(return_value=False)
-        mock_conn.cursor.return_value = mock_cur
+        mock_conn, mock_cur = _make_mock_conn()
 
         session_id = uuid.uuid4()
-        with patch("server.memory._get_conn", return_value=mock_conn):
+        with patch("mcp_server.memory._get_conn", return_value=mock_conn):
             append_turn("dsn", session_id, "assistant", "reply")
 
         _, params = mock_cur.execute.call_args[0]
@@ -580,7 +546,7 @@ class TestLoadWindow:
         mock_conn = self._make_mock_conn(rows)
         session_id = uuid.uuid4()
 
-        with patch("server.memory._get_conn", return_value=mock_conn):
+        with patch("mcp_server.memory._get_conn", return_value=mock_conn):
             messages = load_window("dsn", session_id, window_size=10)
 
         assert messages == [
@@ -593,7 +559,7 @@ class TestLoadWindow:
         mock_conn = self._make_mock_conn([])
         session_id = uuid.uuid4()
 
-        with patch("server.memory._get_conn", return_value=mock_conn):
+        with patch("mcp_server.memory._get_conn", return_value=mock_conn):
             messages = load_window("dsn", session_id, window_size=10)
 
         assert messages == []
@@ -604,7 +570,7 @@ class TestLoadWindow:
         mock_cur = mock_conn.cursor.return_value.__enter__.return_value
         session_id = uuid.uuid4()
 
-        with patch("server.memory._get_conn", return_value=mock_conn):
+        with patch("mcp_server.memory._get_conn", return_value=mock_conn):
             load_window("dsn", session_id, window_size=5)
 
         call_args = mock_cur.execute.call_args
@@ -618,7 +584,7 @@ class TestLoadWindow:
         mock_conn.__exit__ = MagicMock(return_value=False)
         mock_conn.cursor.side_effect = Exception("connection lost")
 
-        with patch("server.memory._get_conn", return_value=mock_conn):
+        with patch("mcp_server.memory._get_conn", return_value=mock_conn):
             messages = load_window("dsn", uuid.uuid4(), window_size=10)
 
         assert messages == []
@@ -629,7 +595,7 @@ class TestLoadWindow:
         mock_cur = mock_conn.cursor.return_value.__enter__.return_value
         session_id = uuid.uuid4()
 
-        with patch("server.memory._get_conn", return_value=mock_conn):
+        with patch("mcp_server.memory._get_conn", return_value=mock_conn):
             load_window("dsn", session_id)
 
         _, params = mock_cur.execute.call_args[0]

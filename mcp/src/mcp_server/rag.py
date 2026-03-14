@@ -3,7 +3,7 @@ from dataclasses import dataclass
 
 from langchain_postgres import PGVector
 
-from server.config import settings
+from mcp_server.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -34,9 +34,7 @@ def get_rag_context(query: str, pgvector_store: PGVector | None) -> RagResult | 
         return None
 
     try:
-        results = pgvector_store.similarity_search_with_score(
-            query, k=settings.server_rag_k
-        )
+        results = pgvector_store.similarity_search_with_score(query, k=settings.rag_k)
 
         if not results:
             return None
@@ -44,13 +42,11 @@ def get_rag_context(query: str, pgvector_store: PGVector | None) -> RagResult | 
         # Fast path: if the best (lowest) score already exceeds the threshold,
         # all results are too distant — skip the filter entirely.
         best_score = results[0][1]
-        if best_score > settings.server_rag_max_distance:
+        if best_score > settings.rag_max_distance:
             return None
 
         filtered = [
-            (doc, score)
-            for doc, score in results
-            if score <= settings.server_rag_max_distance
+            (doc, score) for doc, score in results if score <= settings.rag_max_distance
         ]
 
         if not filtered:

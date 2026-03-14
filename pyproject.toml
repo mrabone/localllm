@@ -1,9 +1,10 @@
 [tool.uv.workspace]
-members = ["cli", "common", "rag", "server"]
+members = ["cli", "common", "mcp", "rag", "server"]
 
 [tool.uv.sources]
 cli = { workspace = true }
 common = { workspace = true }
+mcp-server = { workspace = true }
 rag = { workspace = true }
 server = { workspace = true }
 
@@ -14,6 +15,7 @@ requires-python = ">=3.11"
 dependencies = [
     "cli",
     "common",
+    "mcp-server",
     "rag",
     "server",
 ]
@@ -24,4 +26,4 @@ dev = [
 ]
 
 [tool.pytest.ini_options]
-testpaths = ["cli/tests", "server/tests", "rag/tests"]
+testpaths = ["cli/tests", "mcp/tests", "server/tests", "rag/tests"]
