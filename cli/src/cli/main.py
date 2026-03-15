@@ -54,7 +54,8 @@ class ChatApplication:
                             break
                 except SSEError:
                     response = event_source.response
-                    print(f"\n{response.status_code} {response.text}")
+                    body = response.text[:200]
+                    print(f"\n{response.status_code} {body}")
         except httpx.HTTPError as exc:
             print(f"\nConnection error: {exc}")
 

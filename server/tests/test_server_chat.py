@@ -8,6 +8,13 @@ import pytest
 from server.chat import ChatSession, Role
 
 
+@pytest.fixture(scope="module")
+def thread_pool():
+    pool = ThreadPoolExecutor()
+    yield pool
+    pool.shutdown(wait=True)
+
+
 def _make_tool_result(text: str):
     """Return a mock MCP call_tool result with a single text content item."""
     content_item = MagicMock()
@@ -24,7 +31,7 @@ def _make_empty_tool_result():
     return result
 
 
-def _make_session(**kwargs) -> ChatSession:
+def _make_session(thread_pool: ThreadPoolExecutor, **kwargs) -> ChatSession:
     """Return a ChatSession with mock MCP and Ollama dependencies."""
     mcp_session = AsyncMock()
     mcp_session.call_tool = AsyncMock(return_value=_make_tool_result(""))
@@ -33,7 +40,7 @@ def _make_session(**kwargs) -> ChatSession:
         session_id=kwargs.pop("session_id", uuid.uuid4()),
         mcp_session=kwargs.pop("mcp_session", mcp_session),
         ollama_client=kwargs.pop("ollama_client", ollama_client),
-        thread_pool=kwargs.pop("thread_pool", ThreadPoolExecutor()),
+        thread_pool=kwargs.pop("thread_pool", thread_pool),
         **kwargs,
     )
 
@@ -57,9 +64,9 @@ def _stub_call_tool(tool_responses: dict):
 
 @pytest.mark.asyncio
 class TestChatTokenStream:
-    async def test_stream_yields_tokens(self):
+    async def test_stream_yields_tokens(self, thread_pool):
         """Tokens from ollama_client.chat() are yielded in order."""
-        session = _make_session()
+        session = _make_session(thread_pool)
         session.mcp_session.call_tool = _stub_call_tool({})
         session.client.chat.return_value = iter(
             [
@@ -73,9 +80,9 @@ class TestChatTokenStream:
 
         assert "".join(tokens) == "Hello world"
 
-    async def test_rag_not_called_when_search_returns_empty(self):
+    async def test_rag_not_called_when_search_returns_empty(self, thread_pool):
         """search_knowledge_base is not called when mcp_tools is empty."""
-        session = _make_session()
+        session = _make_session(thread_pool)
         call_tool_mock = _stub_call_tool({})
         session.mcp_session.call_tool = call_tool_mock
         session.client.chat.return_value = iter([{"message": {"content": "ok"}}])
@@ -91,10 +98,10 @@ class TestChatTokenStream:
         ]
         assert len(search_calls) == 0
 
-    async def test_infrastructure_tools_called_unconditionally(self):
+    async def test_infrastructure_tools_called_unconditionally(self, thread_pool):
         """load_long_term_memory, load_conversation_window and persist_message
         are always called even when no mcp_tools are configured."""
-        session = _make_session()
+        session = _make_session(thread_pool)
         call_tool_mock = _stub_call_tool({})
         session.mcp_session.call_tool = call_tool_mock
         session.client.chat.return_value = iter([{"message": {"content": "ok"}}])
@@ -111,9 +118,9 @@ class TestChatTokenStream:
 
 @pytest.mark.asyncio
 class TestContextMessageOrder:
-    async def test_orientation_is_always_first(self):
+    async def test_orientation_is_always_first(self, thread_pool):
         """The orientation system message must always be the first message."""
-        session = _make_session()
+        session = _make_session(thread_pool)
         session.mcp_session.call_tool = _stub_call_tool({})
         session.client.chat.return_value = iter([{"message": {"content": "ok"}}])
 
@@ -125,9 +132,9 @@ class TestContextMessageOrder:
         assert messages[0]["role"] == "system"
         assert "helpful assistant" in messages[0]["content"]
 
-    async def test_no_extra_messages_when_context_empty(self):
+    async def test_no_extra_messages_when_context_empty(self, thread_pool):
         """With no long-term memory, no window, and no RAG: orientation + user = 2 messages."""
-        session = _make_session()
+        session = _make_session(thread_pool)
         session.mcp_session.call_tool = _stub_call_tool({})
         session.client.chat.return_value = iter([{"message": {"content": "ok"}}])
 
@@ -140,9 +147,9 @@ class TestContextMessageOrder:
         assert messages[0]["role"] == "system"
         assert messages[1] == {"role": "user", "content": "hello"}
 
-    async def test_long_term_memory_injected_after_orientation(self):
+    async def test_long_term_memory_injected_after_orientation(self, thread_pool):
         """Long-term memory system message comes immediately after the orientation."""
-        session = _make_session()
+        session = _make_session(thread_pool)
         session.mcp_session.call_tool = _stub_call_tool(
             {"load_long_term_memory": "User is a Python developer"}
         )
@@ -158,13 +165,13 @@ class TestContextMessageOrder:
             "content": "User is a Python developer",
         }
 
-    async def test_window_turns_inserted_after_long_term(self):
+    async def test_window_turns_inserted_after_long_term(self, thread_pool):
         """Window turns (parsed from JSON) are inserted after long-term memory."""
         window_turns = [
             {"role": "user", "content": "prev question"},
             {"role": "assistant", "content": "prev answer"},
         ]
-        session = _make_session()
+        session = _make_session(thread_pool)
         session.mcp_session.call_tool = _stub_call_tool(
             {
                 "load_long_term_memory": "some memory",
@@ -181,9 +188,9 @@ class TestContextMessageOrder:
         assert messages[2] == {"role": "user", "content": "prev question"}
         assert messages[3] == {"role": "assistant", "content": "prev answer"}
 
-    async def test_user_turn_is_always_last_without_tools(self):
+    async def test_user_turn_is_always_last_without_tools(self, thread_pool):
         """The current user turn is the final message when no mcp_tools are configured."""
-        session = _make_session()
+        session = _make_session(thread_pool)
         session.mcp_session.call_tool = _stub_call_tool({})
         session.client.chat.return_value = iter([{"message": {"content": "ok"}}])
 
@@ -194,13 +201,13 @@ class TestContextMessageOrder:
         messages = session.client.chat.call_args[1]["messages"]
         assert messages[-1] == {"role": "user", "content": "my question"}
 
-    async def test_full_context_order(self):
+    async def test_full_context_order(self, thread_pool):
         """Full order: orientation → long_term → window → user."""
         window_turns = [
             {"role": "user", "content": "prev q"},
             {"role": "assistant", "content": "prev a"},
         ]
-        session = _make_session()
+        session = _make_session(thread_pool)
         session.mcp_session.call_tool = _stub_call_tool(
             {
                 "load_long_term_memory": "memory facts",
@@ -225,9 +232,9 @@ class TestContextMessageOrder:
 
 @pytest.mark.asyncio
 class TestMcpToolCallArgs:
-    async def test_load_long_term_memory_called_with_configured_max(self):
+    async def test_load_long_term_memory_called_with_configured_max(self, thread_pool):
         """load_long_term_memory is called with the session id and long_term_max."""
-        session = _make_session()
+        session = _make_session(thread_pool)
         call_tool_mock = _stub_call_tool({})
         session.mcp_session.call_tool = call_tool_mock
         session.client.chat.return_value = iter([{"message": {"content": "ok"}}])
@@ -246,9 +253,11 @@ class TestMcpToolCallArgs:
         assert lt_call.kwargs["arguments"]["long_term_max"] == 5
         assert lt_call.kwargs["arguments"]["session_id"] == str(session.session_id)
 
-    async def test_load_conversation_window_called_with_configured_size(self):
+    async def test_load_conversation_window_called_with_configured_size(
+        self, thread_pool
+    ):
         """load_conversation_window is called with the session id and window_size."""
-        session = _make_session()
+        session = _make_session(thread_pool)
         call_tool_mock = _stub_call_tool({})
         session.mcp_session.call_tool = call_tool_mock
         session.client.chat.return_value = iter([{"message": {"content": "ok"}}])
@@ -267,9 +276,9 @@ class TestMcpToolCallArgs:
         assert win_call.kwargs["arguments"]["window_size"] == 7
         assert win_call.kwargs["arguments"]["session_id"] == str(session.session_id)
 
-    async def test_num_ctx_passed_to_ollama(self):
+    async def test_num_ctx_passed_to_ollama(self, thread_pool):
         """client.chat() must receive num_ctx in its options dict."""
-        session = _make_session()
+        session = _make_session(thread_pool)
         session.mcp_session.call_tool = _stub_call_tool({})
         session.client.chat.return_value = iter([{"message": {"content": "ok"}}])
 
@@ -285,9 +294,9 @@ class TestMcpToolCallArgs:
         call_kwargs = session.client.chat.call_args[1]
         assert call_kwargs["options"]["num_ctx"] == 4096
 
-    async def test_persist_message_called_for_user_turn(self):
+    async def test_persist_message_called_for_user_turn(self, thread_pool):
         """persist_message is called concurrently for the user turn before streaming."""
-        session = _make_session()
+        session = _make_session(thread_pool)
         call_tool_mock = _stub_call_tool({})
         session.mcp_session.call_tool = call_tool_mock
         session.client.chat.return_value = iter([{"message": {"content": "ok"}}])
@@ -306,9 +315,11 @@ class TestMcpToolCallArgs:
         assert user_persist is not None
         assert user_persist.kwargs["arguments"]["content"] == "user input"
 
-    async def test_persist_message_called_for_assistant_turn_after_stream(self):
+    async def test_persist_message_called_for_assistant_turn_after_stream(
+        self, thread_pool
+    ):
         """persist_message is called for the assistant after the stream is consumed."""
-        session = _make_session()
+        session = _make_session(thread_pool)
         call_tool_mock = _stub_call_tool({})
         session.mcp_session.call_tool = call_tool_mock
         session.client.chat.return_value = iter(
@@ -335,9 +346,9 @@ class TestMcpToolCallArgs:
 
 @pytest.mark.asyncio
 class TestEdgeCases:
-    async def test_malformed_window_json_is_ignored(self):
+    async def test_malformed_window_json_is_ignored(self, thread_pool):
         """If window_content is not valid JSON, it is silently skipped."""
-        session = _make_session()
+        session = _make_session(thread_pool)
         session.mcp_session.call_tool = _stub_call_tool(
             {"load_conversation_window": "not valid json {{"}
         )
@@ -350,9 +361,9 @@ class TestEdgeCases:
         messages = session.client.chat.call_args[1]["messages"]
         assert messages[-1] == {"role": "user", "content": "hello"}
 
-    async def test_persist_assistant_failure_does_not_raise(self):
+    async def test_persist_assistant_failure_does_not_raise(self, thread_pool):
         """An error persisting the assistant message must not propagate to the caller."""
-        session = _make_session()
+        session = _make_session(thread_pool)
 
         async def _failing_call_tool(name, *, arguments=None, **kwargs):
             if (

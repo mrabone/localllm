@@ -15,6 +15,13 @@ from server.config import settings
 from server.services import _is_internal_tool
 
 
+@pytest.fixture(scope="module")
+def thread_pool():
+    pool = ThreadPoolExecutor()
+    yield pool
+    pool.shutdown(wait=True)
+
+
 def _make_mcp_tool(name: str, description: str = "", params: dict | None = None):
     """Build a minimal MCP Tool mock with the given name and input schema."""
     tool = MagicMock()
@@ -52,7 +59,9 @@ def _stub_call_tool(tool_responses: dict):
     return AsyncMock(side_effect=_call_tool)
 
 
-def _make_session_with_tools(tools, **kwargs) -> ChatSession:
+def _make_session_with_tools(
+    thread_pool: ThreadPoolExecutor, tools, **kwargs
+) -> ChatSession:
     mcp_session = AsyncMock()
     mcp_session.call_tool = AsyncMock(return_value=_make_tool_result(""))
     ollama_client = MagicMock()
@@ -60,7 +69,7 @@ def _make_session_with_tools(tools, **kwargs) -> ChatSession:
         session_id=kwargs.pop("session_id", uuid.uuid4()),
         mcp_session=kwargs.pop("mcp_session", mcp_session),
         ollama_client=kwargs.pop("ollama_client", ollama_client),
-        thread_pool=kwargs.pop("thread_pool", ThreadPoolExecutor()),
+        thread_pool=kwargs.pop("thread_pool", thread_pool),
         mcp_tools=tools,
         **kwargs,
     )
@@ -268,9 +277,9 @@ class TestBuildToolsSystemMessage:
 
 @pytest.mark.asyncio
 class TestToolCallingLoop:
-    async def test_no_tool_calls_when_mcp_tools_empty(self):
+    async def test_no_tool_calls_when_mcp_tools_empty(self, thread_pool):
         """Without mcp_tools the loop is skipped and Ollama is called once via stream."""
-        session = _make_session_with_tools(tools=[])
+        session = _make_session_with_tools(thread_pool, tools=[])
         session.mcp_session.call_tool = _stub_call_tool({})
         session.client.chat.return_value = iter(
             [{"message": {"content": "direct answer"}}]
@@ -282,10 +291,10 @@ class TestToolCallingLoop:
         call_kwargs = session.client.chat.call_args[1]
         assert call_kwargs["stream"] is True
 
-    async def test_plain_text_response_is_streamed_directly(self):
+    async def test_plain_text_response_is_streamed_directly(self, thread_pool):
         """When the LLM responds without tool calls, its text is streamed as-is."""
         tool = _make_mcp_tool("search_knowledge_base", "Search")
-        session = _make_session_with_tools(tools=[tool])
+        session = _make_session_with_tools(thread_pool, tools=[tool])
         session.mcp_session.call_tool = _stub_call_tool({})
 
         # First call (probe, stream=False) returns plain text
@@ -298,12 +307,12 @@ class TestToolCallingLoop:
         # Should stream the pre-resolved text character by character
         assert "".join(tokens) == "Here is a plain answer."
 
-    async def test_tool_call_result_is_fed_back_to_llm(self):
+    async def test_tool_call_result_is_fed_back_to_llm(self, thread_pool):
         """A tool call response triggers execution and a second LLM call."""
         tool = _make_mcp_tool(
             "search_knowledge_base", "Search", {"query": {"type": "string"}}
         )
-        session = _make_session_with_tools(tools=[tool])
+        session = _make_session_with_tools(thread_pool, tools=[tool])
 
         tool_call_json = json.dumps(
             {
@@ -350,11 +359,11 @@ class TestToolCallingLoop:
         assert tool_result_msg is not None
         assert "The answer is in document 3." in tool_result_msg["content"]
 
-    async def test_multiple_tool_calls_executed_concurrently(self):
+    async def test_multiple_tool_calls_executed_concurrently(self, thread_pool):
         """Multiple tool calls in one response are all executed before the next LLM call."""
         tool_a = _make_mcp_tool("tool_a")
         tool_b = _make_mcp_tool("tool_b")
-        session = _make_session_with_tools(tools=[tool_a, tool_b])
+        session = _make_session_with_tools(thread_pool, tools=[tool_a, tool_b])
 
         tool_call_json = json.dumps(
             {
@@ -393,10 +402,10 @@ class TestToolCallingLoop:
         ]
         assert len(tool_messages) == 2
 
-    async def test_loop_terminates_after_max_iterations(self):
+    async def test_loop_terminates_after_max_iterations(self, thread_pool):
         """The tool-calling loop stops after TOOL_CALL_MAX_LOOPS iterations."""
         tool = _make_mcp_tool("looping_tool")
-        session = _make_session_with_tools(tools=[tool])
+        session = _make_session_with_tools(thread_pool, tools=[tool])
 
         # Always return a tool call to force maximum iterations
         tool_call_json = json.dumps(
@@ -424,10 +433,10 @@ class TestToolCallingLoop:
         # settings.server_tool_call_max_loops probe calls + 1 final streaming call
         assert session.client.chat.call_count == settings.server_tool_call_max_loops + 1
 
-    async def test_unknown_tool_name_returns_error_to_llm(self):
+    async def test_unknown_tool_name_returns_error_to_llm(self, thread_pool):
         """Calling a non-existent tool name adds an error result message to the context."""
         tool = _make_mcp_tool("real_tool")
-        session = _make_session_with_tools(tools=[tool])
+        session = _make_session_with_tools(thread_pool, tools=[tool])
 
         call_count = 0
 
@@ -463,10 +472,10 @@ class TestToolCallingLoop:
         assert "ERROR" in error_msg["content"]
         assert "fake_tool" in error_msg["content"]
 
-    async def test_tool_execution_failure_returns_error_to_llm(self):
+    async def test_tool_execution_failure_returns_error_to_llm(self, thread_pool):
         """An exception during tool execution is returned as an error message, not raised."""
         tool = _make_mcp_tool("fragile_tool")
-        session = _make_session_with_tools(tools=[tool])
+        session = _make_session_with_tools(thread_pool, tools=[tool])
 
         call_count = 0
 
@@ -512,10 +521,10 @@ class TestToolCallingLoop:
         assert error_msg is not None
         assert "ERROR" in error_msg["content"]
 
-    async def test_orientation_message_contains_tool_guidance(self):
+    async def test_orientation_message_contains_tool_guidance(self, thread_pool):
         """When mcp_tools are present the orientation system message includes tool instructions."""
         tool = _make_mcp_tool("my_tool", "Does a thing")
-        session = _make_session_with_tools(tools=[tool])
+        session = _make_session_with_tools(thread_pool, tools=[tool])
         session.mcp_session.call_tool = _stub_call_tool({})
         session.client.chat.return_value = {"message": {"content": "answer"}}
 
@@ -529,10 +538,10 @@ class TestToolCallingLoop:
         assert "my_tool" in orientation["content"]
         assert "toolCalls" in orientation["content"]
 
-    async def test_tool_call_json_not_streamed_to_caller(self):
+    async def test_tool_call_json_not_streamed_to_caller(self, thread_pool):
         """Tool-call JSON produced after loop exhaustion is never yielded to the caller."""
         tool = _make_mcp_tool("looping_tool")
-        session = _make_session_with_tools(tools=[tool])
+        session = _make_session_with_tools(thread_pool, tools=[tool])
 
         tool_call_json = json.dumps(
             {"toolCalls": [{"id": "c1", "name": "looping_tool", "arguments": {}}]}
@@ -565,12 +574,12 @@ class TestToolCallingLoop:
         assert "toolCalls" not in output
         assert "tool_calls" not in output
 
-    async def test_empty_tool_result_replaced_with_fallback_message(self):
+    async def test_empty_tool_result_replaced_with_fallback_message(self, thread_pool):
         """When a tool returns no content the LLM receives an explicit fallback instead of silence."""
         tool = _make_mcp_tool(
             "search_knowledge_base", "Search", {"query": {"type": "string"}}
         )
-        session = _make_session_with_tools(tools=[tool])
+        session = _make_session_with_tools(thread_pool, tools=[tool])
 
         tool_call_json = json.dumps(
             {
@@ -650,10 +659,10 @@ class TestInternalToolFiltering:
 
 @pytest.mark.asyncio
 class TestNoUnconditionalRagCall:
-    async def test_search_knowledge_base_not_called_at_startup(self):
+    async def test_search_knowledge_base_not_called_at_startup(self, thread_pool):
         """The server must not call search_knowledge_base unconditionally on every turn."""
         tool = _make_mcp_tool("search_knowledge_base", "Search")
-        session = _make_session_with_tools(tools=[tool])
+        session = _make_session_with_tools(thread_pool, tools=[tool])
 
         called_tool_names: list[str] = []
 
@@ -670,10 +679,10 @@ class TestNoUnconditionalRagCall:
 
         assert "search_knowledge_base" not in called_tool_names
 
-    async def test_infrastructure_tools_still_called_unconditionally(self):
+    async def test_infrastructure_tools_still_called_unconditionally(self, thread_pool):
         """load_long_term_memory, load_conversation_window, and persist_message
         must still be called by the server on every turn regardless of model tools."""
-        session = _make_session_with_tools(tools=[])
+        session = _make_session_with_tools(thread_pool, tools=[])
 
         called_tool_names: list[str] = []
 
@@ -695,11 +704,11 @@ class TestNoUnconditionalRagCall:
 
 @pytest.mark.asyncio
 class TestJsonSafetyGuard:
-    async def test_json_shaped_non_tool_response_not_streamed(self):
+    async def test_json_shaped_non_tool_response_not_streamed(self, thread_pool):
         """A JSON response that parse_tool_calls cannot parse must not become the
         resolved_answer and must not leak raw JSON to the caller."""
         tool = _make_mcp_tool("search_knowledge_base", "Search")
-        session = _make_session_with_tools(tools=[tool])
+        session = _make_session_with_tools(thread_pool, tools=[tool])
         session.mcp_session.call_tool = _stub_call_tool({})
 
         # JSON-shaped but not a valid tool-call payload — parse_tool_calls returns []

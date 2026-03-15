@@ -1,5 +1,4 @@
 import logging
-from dataclasses import dataclass
 
 import psycopg2
 import psycopg2.pool
