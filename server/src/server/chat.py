@@ -79,7 +79,9 @@ def build_tools_system_message(tools: list[Tool]) -> str:
         "You may call any of the following tools when you need to retrieve "
         "information or perform an action.  To call a tool, respond with a JSON "
         "object — and nothing else — in exactly this format:\n\n"
-        '{"toolCalls": [{"id": "call_1", "name": "<tool_name>", "arguments": {<args>}}]}\n\n'
+        '{"toolCalls": [{"id": "call_1", "name": "<tool_name>", "arguments": {"param": "value"}}]}\n\n'
+        "Replace <tool_name> with the tool you want to call and fill the "
+        '"arguments" object with the parameter names and values for that tool.\n\n'
         "You may include multiple tool calls in a single response.  After receiving "
         "tool results you will be prompted again to continue your answer.\n\n"
         "Only output the JSON when you want to call a tool.  Do not wrap it in "
@@ -372,19 +374,45 @@ class ChatSession:
 
         mcp_session = self.mcp_session
 
-        async def _collect_stream(ollama_messages: list[dict]) -> list[str]:
-            loop = asyncio.get_running_loop()
+        async def _stream_tokens(
+            ollama_messages: list[dict],
+        ) -> AsyncGenerator[str, None]:
+            """Stream tokens from Ollama incrementally via a queue.
 
-            def _run() -> list[str]:
-                stream = self.client.chat(
-                    model=self.model,
-                    messages=ollama_messages,
-                    stream=True,
-                    options={"num_ctx": settings.server_ollama_num_ctx},
-                )
-                return [chunk["message"]["content"] for chunk in stream]
+            The background thread pushes each chunk into the queue as it arrives
+            so the async generator can yield tokens to the caller without waiting
+            for the entire response to be generated first.  A ``None`` sentinel
+            signals end-of-stream; an ``Exception`` signals a streaming error.
+            """
+            queue: asyncio.Queue[str | None | Exception] = asyncio.Queue()
+            current_loop = asyncio.get_running_loop()
 
-            return await loop.run_in_executor(self.thread_pool, _run)
+            def _run() -> None:
+                try:
+                    stream = self.client.chat(
+                        model=self.model,
+                        messages=ollama_messages,
+                        stream=True,
+                        options={"num_ctx": settings.server_ollama_num_ctx},
+                    )
+                    for chunk in stream:
+                        current_loop.call_soon_threadsafe(
+                            queue.put_nowait, chunk["message"]["content"]
+                        )
+                except Exception as exc:
+                    current_loop.call_soon_threadsafe(queue.put_nowait, exc)
+                finally:
+                    current_loop.call_soon_threadsafe(queue.put_nowait, None)
+
+            self.thread_pool.submit(_run)
+
+            while True:
+                item = await queue.get()
+                if item is None:
+                    break
+                if isinstance(item, Exception):
+                    raise item
+                yield item
 
         async def _persisting_stream() -> AsyncGenerator[str, None]:
             assembled = ""
@@ -392,8 +420,11 @@ class ChatSession:
                 assembled = resolved_answer
                 yield resolved_answer
             else:
-                tokens = await _collect_stream(messages)
-                streamed_text = "".join(tokens)
+                streamed_tokens: list[str] = []
+                async for token in _stream_tokens(messages):
+                    streamed_tokens.append(token)
+
+                streamed_text = "".join(streamed_tokens)
 
                 if parse_tool_calls(streamed_text):
                     logger.warning(
@@ -424,7 +455,7 @@ class ChatSession:
                     yield assembled
                 else:
                     assembled = streamed_text
-                    for token in tokens:
+                    for token in streamed_tokens:
                         yield token
 
             try:

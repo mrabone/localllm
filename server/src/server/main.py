@@ -2,6 +2,7 @@ import logging
 import uuid
 from typing import AsyncGenerator
 
+import anyio
 import httpx
 import uvicorn
 from fastapi import FastAPI, HTTPException
@@ -46,7 +47,7 @@ class ChatRequest(BaseModel):
 
 
 @app.post("/sessions", response_model=CreateSessionResponse, status_code=201)
-async def create_new_session(pg_dsn: PgDsnDep) -> CreateSessionResponse:
+def create_new_session(pg_dsn: PgDsnDep) -> CreateSessionResponse:
     """Create a new conversation session and return its ID."""
     session_id = create_session(pg_dsn)
     logger.info("Created session %s.", session_id)
@@ -54,9 +55,7 @@ async def create_new_session(pg_dsn: PgDsnDep) -> CreateSessionResponse:
 
 
 @app.head("/sessions/{session_id}", status_code=200)
-async def check_session_exists_endpoint(
-    session_id: uuid.UUID, pg_dsn: PgDsnDep
-) -> None:
+def check_session_exists_endpoint(session_id: uuid.UUID, pg_dsn: PgDsnDep) -> None:
     """Check whether a session exists without loading its history.
 
     Returns 200 if found, 404 if not.  Used by the CLI at startup to validate
@@ -71,7 +70,8 @@ async def get_session_history(
     session_id: uuid.UUID, pg_dsn: PgDsnDep, mcp_session: McpSessionDep
 ) -> SessionHistoryResponse:
     """Return the stored memories for an existing session."""
-    if not session_exists(pg_dsn, session_id):
+    exists = await anyio.to_thread.run_sync(lambda: session_exists(pg_dsn, session_id))
+    if not exists:
         raise HTTPException(status_code=404, detail="Session not found.")
 
     memories_result = await mcp_session.call_tool(
@@ -105,7 +105,10 @@ async def chat(
 
     async def event_generator() -> AsyncGenerator[dict, None]:
         try:
-            if not session_exists(pg_dsn, session_id):
+            session_found = await anyio.to_thread.run_sync(
+                lambda: session_exists(pg_dsn, session_id)
+            )
+            if not session_found:
                 yield {"event": "error", "data": "Session not found."}
                 return
 
