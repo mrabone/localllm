@@ -70,6 +70,40 @@ services:
       retries: 5
       start_period: 10s
 
+  mcp:
+    build:
+      context: .
+      dockerfile: mcp/Dockerfile
+      target: ${MCP_BUILD_TARGET:-runtime}
+    container_name: localllm-mcp
+    restart: unless-stopped
+    ports:
+      - "8001:8001"
+    volumes:
+      - ./mcp/src/mcp_server:/usr/local/lib/python3.12/site-packages/mcp_server:ro
+      - ./common/src/common:/app/common/src/common:ro
+    environment:
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - PG_HOST=db
+      - PG_PORT=5432
+      - PG_DATABASE=${PG_DATABASE:-rag_db}
+      - PG_USER=${PG_USER:-user}
+      - PG_PASSWORD=${PG_PASSWORD:-password}
+      - MCP_HOST=0.0.0.0
+      - MCP_PORT=8001
+      - MCP_ENABLE_RAG=${MCP_ENABLE_RAG:-false}
+    depends_on:
+      ollama:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
   server:
     build:
       context: .
@@ -92,11 +126,20 @@ services:
       - SERVER_HOST=0.0.0.0
       - SERVER_PORT=8000
       - SERVER_RELOAD=${SERVER_RELOAD:-false}
+      - MCP_SERVER_URL=http://mcp:8001
     depends_on:
       ollama:
         condition: service_healthy
       db:
         condition: service_healthy
+      mcp:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
 
 volumes:
   ollama_data:

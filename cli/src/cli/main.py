@@ -1,9 +1,8 @@
 import argparse
-import json
 import sys
 
 import httpx
-from httpx_sse import connect_sse
+from httpx_sse import SSEError, connect_sse
 
 from cli.config import settings
 from cli.services import get_or_create_session
@@ -34,44 +33,33 @@ class ChatApplication:
         """Send user_input to the server and stream the response to stdout."""
         url = f"{settings.server_url}/sessions/{self.session_id}/chat"
 
-        rag_doc_count: int | None = None
         print(f"\n{Colors.CYAN}{Colors.BOLD}Assistant:{Colors.RESET}")
 
-        with connect_sse(
-            self.client,
-            "POST",
-            url,
-            json={"message": user_input},
-            timeout=None,
-        ) as event_source:
-            if event_source.response.status_code != 200:
-                # Truncate the body to avoid leaking server-side stack traces
-                # or configuration details to the terminal.
-                # .read() must be called explicitly because the response is
-                # opened as a stream and .text is not available until buffered.
-                event_source.response.read()
-                raw = event_source.response.text[:200]
-                print(f"Server error {event_source.response.status_code}: {raw}")
-                return
-
-            for sse in event_source.iter_sse():
-                if sse.event == "token":
-                    print(sse.data, end="", flush=True)
-                elif sse.event == "rag":
-                    rag_doc_count = json.loads(sse.data)["document_count"]
-                elif sse.event == "error":
-                    print(f"\nServer error: {sse.data}")
-                    break
-                elif sse.event == "done":
-                    break
+        try:
+            with connect_sse(
+                self.client,
+                "POST",
+                url,
+                json={"message": user_input},
+                timeout=httpx.Timeout(connect=10.0, read=300.0, write=10.0, pool=10.0),
+            ) as event_source:
+                try:
+                    for sse in event_source.iter_sse():
+                        if sse.event == "token":
+                            print(sse.data, end="", flush=True)
+                        elif sse.event == "error":
+                            print(f"\nServer error: {sse.data}")
+                            break
+                        elif sse.event == "done":
+                            break
+                except SSEError:
+                    response = event_source.response
+                    body = response.text[:200]
+                    print(f"\n{response.status_code} {body}")
+        except httpx.HTTPError as exc:
+            print(f"\nConnection error: {exc}")
 
         print("\n")
-
-        if rag_doc_count is not None:
-            print(
-                f"{Colors.CYAN}(RAG: retrieved context from "
-                f"{rag_doc_count} document(s)){Colors.RESET}\n"
-            )
 
     def run(self) -> None:
         """Run the interactive chat REPL until the user exits."""

@@ -316,59 +316,6 @@ class TestChatApplication:
         assert "Hello" in captured.out
         assert " world" in captured.out
 
-    def test_chat_shows_rag_info(self, tmp_path, capsys):
-        session_id = uuid.uuid4()
-        sse_body = _make_sse_response(
-            [
-                ("rag", '{"document_count": 3}'),
-                ("token", "Answer"),
-                ("done", "[DONE]"),
-            ]
-        )
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            return httpx.Response(
-                200, text=sse_body, headers={"content-type": "text/event-stream"}
-            )
-
-        transport = httpx.MockTransport(handler)
-        client = httpx.Client(transport=transport)
-
-        app = ChatApplication.__new__(ChatApplication)
-        app.client = client
-        app.session_id = session_id
-        app.session_name = ""
-
-        with patch("cli.main.settings") as mock_settings:
-            mock_settings.server_url = "http://test"
-            app.chat("hi")
-
-        captured = capsys.readouterr()
-        assert "3 document(s)" in captured.out
-
-    def test_run_displays_session_name_when_named(self, tmp_path, capsys):
-        app = self._make_app(
-            lambda r: httpx.Response(404), tmp_path, session_name="work"
-        )
-
-        with patch("cli.main.settings"):
-            with patch("builtins.input", side_effect=["exit"]):
-                app.run()
-
-        captured = capsys.readouterr()
-        assert "'work'" in captured.out
-
-    def test_run_displays_uuid_when_anonymous(self, tmp_path, capsys):
-        app = self._make_app(lambda r: httpx.Response(404), tmp_path)
-        uuid_str = str(app.session_id)
-
-        with patch("cli.main.settings"):
-            with patch("builtins.input", side_effect=["exit"]):
-                app.run()
-
-        captured = capsys.readouterr()
-        assert uuid_str in captured.out
-
     def test_chat_handles_non_200_response(self, tmp_path, capsys):
         """Non-200 responses must not raise ResponseNotRead (regression test)."""
 

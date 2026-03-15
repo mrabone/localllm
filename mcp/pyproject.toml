@@ -1,18 +1,20 @@
 [project]
-name = "server"
+name = "mcp-server"
 version = "0.1.0"
-description = "HTTP server for the localLLM chat application"
+description = "MCP server exposing tools for the localLLM application"
 requires-python = ">=3.11"
 dependencies = [
     "common",
-    "fastapi>=0.115.0",
-    "uvicorn[standard]>=0.32.0",
-    "httpx>=0.28.0",
-    "mcp>=1.0.0",
+    "fastmcp>=2.0.0",
+    "langchain-ollama",
+    "langchain-postgres",
+    "mem0ai",
     "ollama>=0.6.1",
     "pydantic>=2.0",
     "pydantic-settings>=2.0",
-    "sse-starlette>=2.1.0",
+    "sqlalchemy",
+    "httpx>=0.28.0",
+    "uvicorn[standard]>=0.32.0",
 ]
 
 [tool.uv.sources]
@@ -21,12 +23,8 @@ common = { workspace = true }
 [dependency-groups]
 dev = [
     "pytest>=9.0.2",
-    "pytest-asyncio>=0.24.0",
 ]
-
-[tool.pytest.ini_options]
-asyncio_mode = "auto"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
-packages = ["server"]
+packages = ["mcp_server"]

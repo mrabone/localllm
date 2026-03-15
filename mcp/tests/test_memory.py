@@ -1,14 +1,13 @@
 import uuid
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
-from server.memory import (
+from mcp_server.memory import (
     append_turn,
     create_session,
     ensure_turns_table,
     load_long_term_memories,
-    load_messages,
     load_window,
     save_message,
     session_exists,
@@ -31,14 +30,14 @@ class TestCreateSession:
     def test_returns_uuid(self):
         """create_session should return a UUID object."""
         mock_conn, _ = _make_mock_conn()
-        with patch("server.memory._get_conn", return_value=mock_conn):
+        with patch("common.session_store.get_conn", return_value=mock_conn):
             session_id = create_session("dsn")
         assert isinstance(session_id, uuid.UUID)
 
     def test_each_call_returns_unique_uuid(self):
         """create_session should return a different UUID each time."""
         mock_conn, _ = _make_mock_conn()
-        with patch("server.memory._get_conn", return_value=mock_conn):
+        with patch("common.session_store.get_conn", return_value=mock_conn):
             session_id_1 = create_session("dsn")
             session_id_2 = create_session("dsn")
         assert session_id_1 != session_id_2
@@ -46,7 +45,7 @@ class TestCreateSession:
     def test_returned_uuid_is_valid(self):
         """The returned UUID should be valid and convertible to string."""
         mock_conn, _ = _make_mock_conn()
-        with patch("server.memory._get_conn", return_value=mock_conn):
+        with patch("common.session_store.get_conn", return_value=mock_conn):
             session_id = create_session("dsn")
         str_id = str(session_id)
         assert len(str_id) == 36
@@ -55,7 +54,7 @@ class TestCreateSession:
     def test_inserts_row_into_chat_sessions(self):
         """create_session should INSERT the new UUID into chat_sessions."""
         mock_conn, mock_cur = _make_mock_conn()
-        with patch("server.memory._get_conn", return_value=mock_conn):
+        with patch("common.session_store.get_conn", return_value=mock_conn):
             session_id = create_session("dsn")
         mock_cur.execute.assert_called_once()
         sql, params = mock_cur.execute.call_args[0]
@@ -70,7 +69,7 @@ class TestSessionExists:
         mock_cur.fetchone.return_value = (1,)
 
         session_id = uuid.uuid4()
-        with patch("server.memory._get_conn", return_value=mock_conn):
+        with patch("common.session_store.get_conn", return_value=mock_conn):
             result = session_exists("dsn", session_id)
 
         assert result is True
@@ -81,45 +80,22 @@ class TestSessionExists:
         mock_cur.fetchone.return_value = None
 
         session_id = uuid.uuid4()
-        with patch("server.memory._get_conn", return_value=mock_conn):
+        with patch("common.session_store.get_conn", return_value=mock_conn):
             result = session_exists("dsn", session_id)
 
         assert result is False
 
-    def test_returns_false_when_get_all_returns_dict_with_empty_results(self):
-        """session_exists should return False when no row is found (fetchone returns None)."""
-        mock_conn, mock_cur = _make_mock_conn()
-        mock_cur.fetchone.return_value = None
-
-        session_id = uuid.uuid4()
-        with patch("server.memory._get_conn", return_value=mock_conn):
-            result = session_exists("dsn", session_id)
-
-        assert result is False
-
-    def test_returns_true_when_get_all_returns_dict_with_populated_results(self):
-        """session_exists should return True when a row is found (fetchone returns a row)."""
-        mock_conn, mock_cur = _make_mock_conn()
-        mock_cur.fetchone.return_value = (1,)
-
-        session_id = uuid.uuid4()
-        with patch("server.memory._get_conn", return_value=mock_conn):
-            result = session_exists("dsn", session_id)
-
-        assert result is True
-
-    def test_handles_exception_gracefully(self):
-        """session_exists should return False if the DB raises an exception."""
+    def test_raises_on_db_error(self):
+        """session_exists should propagate DB exceptions to the caller."""
         mock_conn = MagicMock()
         mock_conn.__enter__ = MagicMock(return_value=mock_conn)
         mock_conn.__exit__ = MagicMock(return_value=False)
         mock_conn.cursor.side_effect = Exception("Connection error")
 
         session_id = uuid.uuid4()
-        with patch("server.memory._get_conn", return_value=mock_conn):
-            result = session_exists("dsn", session_id)
-
-        assert result is False
+        with patch("common.session_store.get_conn", return_value=mock_conn):
+            with pytest.raises(Exception, match="Connection error"):
+                session_exists("dsn", session_id)
 
     def test_converts_session_id_to_string(self):
         """session_exists should pass the UUID as a string to the SQL query."""
@@ -127,7 +103,7 @@ class TestSessionExists:
         mock_cur.fetchone.return_value = None
 
         session_id = uuid.uuid4()
-        with patch("server.memory._get_conn", return_value=mock_conn):
+        with patch("common.session_store.get_conn", return_value=mock_conn):
             session_exists("dsn", session_id)
 
         _, params = mock_cur.execute.call_args[0]
@@ -215,283 +191,12 @@ class TestSaveMessage:
         assert call_args[0][0][0]["content"] == content
 
 
-class TestLoadMessages:
-    def test_returns_empty_list_for_empty_results(self):
-        """load_messages should return empty list when no memories exist."""
-        mem0 = MagicMock()
-        mem0.get_all.return_value = []
-
-        session_id = uuid.uuid4()
-        messages = load_messages(mem0, session_id, query="")
-
-        assert messages == []
-
-    def test_calls_get_all_when_query_is_empty(self):
-        """load_messages should call get_all when query is empty string."""
-        mem0 = MagicMock()
-        mem0.get_all.return_value = []
-
-        session_id = uuid.uuid4()
-        load_messages(mem0, session_id, query="")
-
-        mem0.get_all.assert_called_once_with(user_id=str(session_id))
-        mem0.search.assert_not_called()
-
-    def test_calls_search_when_query_is_provided(self):
-        """load_messages should call search when query is non-empty."""
-        mem0 = MagicMock()
-        mem0.search.return_value = []
-
-        session_id = uuid.uuid4()
-        load_messages(mem0, session_id, query="What is France?")
-
-        mem0.search.assert_called_once_with("What is France?", user_id=str(session_id))
-        mem0.get_all.assert_not_called()
-
-    def test_extracts_memory_field(self):
-        """load_messages should extract and return memory field from results."""
-        mem0 = MagicMock()
-        mem0.get_all.return_value = [
-            {"memory": "Paris is the capital of France"},
-            {"memory": "France is in Western Europe"},
-        ]
-
-        session_id = uuid.uuid4()
-        messages = load_messages(mem0, session_id, query="")
-
-        assert len(messages) == 2
-        assert messages[0]["role"] == "system"
-        assert messages[0]["content"] == "Paris is the capital of France"
-        assert messages[1]["role"] == "system"
-        assert messages[1]["content"] == "France is in Western Europe"
-
-    def test_extracts_content_field_as_fallback(self):
-        """load_messages should extract content field if memory field is missing."""
-        mem0 = MagicMock()
-        mem0.get_all.return_value = [
-            {"content": "Test message", "role": "user"},
-        ]
-
-        session_id = uuid.uuid4()
-        messages = load_messages(mem0, session_id, query="")
-
-        assert len(messages) == 1
-        assert messages[0]["content"] == "Test message"
-
-    def test_preserves_role_from_result(self):
-        """load_messages should preserve role field from result if present."""
-        mem0 = MagicMock()
-        mem0.get_all.return_value = [
-            {"content": "User said this", "role": "user"},
-            {"content": "Assistant replied", "role": "assistant"},
-        ]
-
-        session_id = uuid.uuid4()
-        messages = load_messages(mem0, session_id, query="")
-
-        assert messages[0]["role"] == "user"
-        assert messages[1]["role"] == "assistant"
-
-    def test_defaults_to_system_role_when_missing(self):
-        """load_messages should default to system role if role field is absent."""
-        mem0 = MagicMock()
-        mem0.get_all.return_value = [
-            {"memory": "A fact about Paris"},
-        ]
-
-        session_id = uuid.uuid4()
-        messages = load_messages(mem0, session_id, query="")
-
-        assert messages[0]["role"] == "system"
-
-    def test_handles_dict_with_results_key(self):
-        """load_messages should extract results from dict if it has 'results' key."""
-        mem0 = MagicMock()
-        mem0.get_all.return_value = {
-            "results": [{"memory": "Test fact"}],
-        }
-
-        session_id = uuid.uuid4()
-        messages = load_messages(mem0, session_id, query="")
-
-        assert len(messages) == 1
-        assert messages[0]["content"] == "Test fact"
-
-    def test_handles_dict_with_data_key(self):
-        """load_messages should extract data from dict if it has 'data' key."""
-        mem0 = MagicMock()
-        mem0.get_all.return_value = {
-            "data": [{"memory": "Test fact"}],
-        }
-
-        session_id = uuid.uuid4()
-        messages = load_messages(mem0, session_id, query="")
-
-        assert len(messages) == 1
-        assert messages[0]["content"] == "Test fact"
-
-    def test_filters_out_empty_memories(self):
-        """load_messages should skip items without content."""
-        mem0 = MagicMock()
-        mem0.get_all.return_value = [
-            {"memory": "Valid memory"},
-            {"other_field": "value"},
-            {"memory": "Another valid memory"},
-        ]
-
-        session_id = uuid.uuid4()
-        messages = load_messages(mem0, session_id, query="")
-
-        assert len(messages) == 2
-        assert messages[0]["content"] == "Valid memory"
-        assert messages[1]["content"] == "Another valid memory"
-
-    def test_handles_non_dict_items_gracefully(self):
-        """load_messages should skip non-dict items in results."""
-        mem0 = MagicMock()
-        mem0.get_all.return_value = [
-            {"memory": "Valid memory"},
-            "invalid string",
-            {"memory": "Another valid memory"},
-        ]
-
-        session_id = uuid.uuid4()
-        messages = load_messages(mem0, session_id, query="")
-
-        assert len(messages) == 2
-
-    def test_returns_empty_list_on_exception(self):
-        """load_messages should return empty list if an exception occurs."""
-        mem0 = MagicMock()
-        mem0.get_all.side_effect = Exception("Connection error")
-
-        session_id = uuid.uuid4()
-        messages = load_messages(mem0, session_id, query="")
-
-        assert messages == []
-
-    def test_search_with_custom_query(self):
-        """load_messages should pass the query correctly to mem0.search."""
-        mem0 = MagicMock()
-        mem0.search.return_value = [
-            {"memory": "Relevant memory about Paris"},
-        ]
-
-        session_id = uuid.uuid4()
-        query = "Tell me about Paris"
-        messages = load_messages(mem0, session_id, query=query)
-
-        mem0.search.assert_called_once_with(query, user_id=str(session_id))
-        assert len(messages) == 1
-        assert messages[0]["content"] == "Relevant memory about Paris"
-
-    def test_converts_session_id_to_string(self):
-        """load_messages should convert session UUID to string."""
-        mem0 = MagicMock()
-        mem0.get_all.return_value = []
-
-        session_id = uuid.uuid4()
-        load_messages(mem0, session_id, query="")
-
-        call_args = mem0.get_all.call_args
-        assert call_args[1]["user_id"] == str(session_id)
-
-    def test_handles_search_returning_dict(self):
-        """load_messages should handle search returning a dict with results."""
-        mem0 = MagicMock()
-        mem0.search.return_value = {
-            "results": [{"memory": "Search result"}],
-        }
-
-        session_id = uuid.uuid4()
-        messages = load_messages(mem0, session_id, query="test")
-
-        assert len(messages) == 1
-        assert messages[0]["content"] == "Search result"
-
-    def test_tries_multiple_content_field_names(self):
-        """load_messages should try 'memory', 'content', 'data', 'text' in order."""
-        mem0 = MagicMock()
-        mem0.get_all.return_value = [
-            {"data": "From data field"},
-            {"text": "From text field"},
-        ]
-
-        session_id = uuid.uuid4()
-        messages = load_messages(mem0, session_id, query="")
-
-        assert len(messages) == 2
-        assert messages[0]["content"] == "From data field"
-        assert messages[1]["content"] == "From text field"
-
-    def test_memory_field_takes_priority(self):
-        """load_messages should prefer 'memory' field over others."""
-        mem0 = MagicMock()
-        mem0.get_all.return_value = [
-            {
-                "memory": "From memory",
-                "content": "From content",
-                "data": "From data",
-            },
-        ]
-
-        session_id = uuid.uuid4()
-        messages = load_messages(mem0, session_id, query="")
-
-        assert messages[0]["content"] == "From memory"
-
-    def test_respects_max_messages_cap(self):
-        """load_messages should return at most max_messages entries."""
-        mem0 = MagicMock()
-        mem0.get_all.return_value = [{"memory": f"fact {i}"} for i in range(20)]
-
-        session_id = uuid.uuid4()
-        messages = load_messages(mem0, session_id, query="", max_messages=5)
-
-        assert len(messages) == 5
-
-    def test_cap_keeps_first_entries(self):
-        """load_messages should keep the first (most-relevant) entries when capping."""
-        mem0 = MagicMock()
-        mem0.get_all.return_value = [{"memory": f"fact {i}"} for i in range(20)]
-
-        session_id = uuid.uuid4()
-        messages = load_messages(mem0, session_id, query="", max_messages=3)
-
-        assert messages[0]["content"] == "fact 0"
-        assert messages[1]["content"] == "fact 1"
-        assert messages[2]["content"] == "fact 2"
-
-    def test_does_not_cap_when_results_within_limit(self):
-        """load_messages should return all entries when count is below the cap."""
-        mem0 = MagicMock()
-        mem0.get_all.return_value = [
-            {"memory": "fact a"},
-            {"memory": "fact b"},
-        ]
-
-        session_id = uuid.uuid4()
-        messages = load_messages(mem0, session_id, query="", max_messages=10)
-
-        assert len(messages) == 2
-
-    def test_default_max_messages_is_ten(self):
-        """The default cap should be 10 so callers do not need to pass max_messages."""
-        mem0 = MagicMock()
-        mem0.get_all.return_value = [{"memory": f"fact {i}"} for i in range(15)]
-
-        session_id = uuid.uuid4()
-        messages = load_messages(mem0, session_id, query="")
-
-        assert len(messages) == 10
-
-
 class TestEnsureTurnsTable:
     def test_executes_create_table_and_index(self):
         """ensure_turns_table should execute CREATE TABLE (sessions), CREATE TABLE (turns) and CREATE INDEX statements."""
         mock_conn, mock_cur = _make_mock_conn()
 
-        with patch("server.memory._get_conn", return_value=mock_conn):
+        with patch("common.session_store.get_conn", return_value=mock_conn):
             ensure_turns_table("host=localhost dbname=test")
 
         assert mock_cur.execute.call_count == 3
@@ -503,7 +208,7 @@ class TestEnsureTurnsTable:
         mock_conn.__exit__ = MagicMock(return_value=False)
         mock_conn.cursor.side_effect = Exception("DB error")
 
-        with patch("server.memory._get_conn", return_value=mock_conn):
+        with patch("common.session_store.get_conn", return_value=mock_conn):
             with pytest.raises(Exception, match="DB error"):
                 ensure_turns_table("host=localhost dbname=test")
 
@@ -511,16 +216,10 @@ class TestEnsureTurnsTable:
 class TestAppendTurn:
     def test_inserts_row_with_correct_values(self):
         """append_turn should INSERT a row with session_id, role, and content."""
-        mock_conn = MagicMock()
-        mock_cur = MagicMock()
-        mock_conn.__enter__ = MagicMock(return_value=mock_conn)
-        mock_conn.__exit__ = MagicMock(return_value=False)
-        mock_cur.__enter__ = MagicMock(return_value=mock_cur)
-        mock_cur.__exit__ = MagicMock(return_value=False)
-        mock_conn.cursor.return_value = mock_cur
+        mock_conn, mock_cur = _make_mock_conn()
 
         session_id = uuid.uuid4()
-        with patch("server.memory._get_conn", return_value=mock_conn):
+        with patch("mcp_server.memory.get_conn", return_value=mock_conn):
             append_turn("dsn", session_id, "user", "hello")
 
         mock_cur.execute.assert_called_once()
@@ -536,22 +235,16 @@ class TestAppendTurn:
         mock_conn.__exit__ = MagicMock(return_value=False)
         mock_conn.cursor.side_effect = Exception("write error")
 
-        with patch("server.memory._get_conn", return_value=mock_conn):
+        with patch("mcp_server.memory.get_conn", return_value=mock_conn):
             with pytest.raises(Exception, match="write error"):
                 append_turn("dsn", uuid.uuid4(), "user", "hello")
 
     def test_converts_session_id_to_string(self):
         """append_turn should pass the session UUID as a string to the DB."""
-        mock_conn = MagicMock()
-        mock_cur = MagicMock()
-        mock_conn.__enter__ = MagicMock(return_value=mock_conn)
-        mock_conn.__exit__ = MagicMock(return_value=False)
-        mock_cur.__enter__ = MagicMock(return_value=mock_cur)
-        mock_cur.__exit__ = MagicMock(return_value=False)
-        mock_conn.cursor.return_value = mock_cur
+        mock_conn, mock_cur = _make_mock_conn()
 
         session_id = uuid.uuid4()
-        with patch("server.memory._get_conn", return_value=mock_conn):
+        with patch("mcp_server.memory.get_conn", return_value=mock_conn):
             append_turn("dsn", session_id, "assistant", "reply")
 
         _, params = mock_cur.execute.call_args[0]
@@ -580,7 +273,7 @@ class TestLoadWindow:
         mock_conn = self._make_mock_conn(rows)
         session_id = uuid.uuid4()
 
-        with patch("server.memory._get_conn", return_value=mock_conn):
+        with patch("mcp_server.memory.get_conn", return_value=mock_conn):
             messages = load_window("dsn", session_id, window_size=10)
 
         assert messages == [
@@ -593,7 +286,7 @@ class TestLoadWindow:
         mock_conn = self._make_mock_conn([])
         session_id = uuid.uuid4()
 
-        with patch("server.memory._get_conn", return_value=mock_conn):
+        with patch("mcp_server.memory.get_conn", return_value=mock_conn):
             messages = load_window("dsn", session_id, window_size=10)
 
         assert messages == []
@@ -604,7 +297,7 @@ class TestLoadWindow:
         mock_cur = mock_conn.cursor.return_value.__enter__.return_value
         session_id = uuid.uuid4()
 
-        with patch("server.memory._get_conn", return_value=mock_conn):
+        with patch("mcp_server.memory.get_conn", return_value=mock_conn):
             load_window("dsn", session_id, window_size=5)
 
         call_args = mock_cur.execute.call_args
@@ -618,7 +311,7 @@ class TestLoadWindow:
         mock_conn.__exit__ = MagicMock(return_value=False)
         mock_conn.cursor.side_effect = Exception("connection lost")
 
-        with patch("server.memory._get_conn", return_value=mock_conn):
+        with patch("mcp_server.memory.get_conn", return_value=mock_conn):
             messages = load_window("dsn", uuid.uuid4(), window_size=10)
 
         assert messages == []
@@ -629,7 +322,7 @@ class TestLoadWindow:
         mock_cur = mock_conn.cursor.return_value.__enter__.return_value
         session_id = uuid.uuid4()
 
-        with patch("server.memory._get_conn", return_value=mock_conn):
+        with patch("mcp_server.memory.get_conn", return_value=mock_conn):
             load_window("dsn", session_id)
 
         _, params = mock_cur.execute.call_args[0]

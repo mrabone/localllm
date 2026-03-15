@@ -1,140 +1,222 @@
+import asyncio
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from typing import Annotated, AsyncGenerator
 
-from fastapi import Depends, FastAPI
-from langchain_ollama import OllamaEmbeddings
-from langchain_postgres import PGVector
-from mem0 import Memory
+from fastapi import Depends, FastAPI, HTTPException
+from mcp import ClientSession
+from mcp.client.streamable_http import streamablehttp_client
+from mcp.types import Tool
 from ollama import Client
 
+from common.db import build_pg_dsn
+from common.db_pool import close_pool, init_pool
+from common.session_store import ensure_turns_table
 from server.config import settings
-from server.memory import _close_pool, _init_pool, ensure_turns_table
 
 logger = logging.getLogger(__name__)
 
-# Module-level singletons populated during lifespan startup.
-_mem0: Memory | None = None
-_ollama_client: Client | None = None
-_rag_store: PGVector | None = None
-_pg_dsn: str | None = None
+
+@asynccontextmanager
+async def _mcp_session_with_retries(
+    mcp_url: str,
+    max_retries: int = 5,
+    initial_wait_seconds: float = 1.0,
+) -> AsyncGenerator[tuple[ClientSession, list[Tool]], None]:
+    """Open a long-lived MCP session with exponential backoff retry logic.
+
+    Keeps the underlying HTTP transport open for the duration of the context
+    so the session's write stream remains valid across multiple requests.
+
+    Yields:
+        Tuple of (ClientSession, list of available tools).
+
+    Raises:
+        RuntimeError: If connection fails after all retry attempts.
+    """
+    last_exception: Exception | None = None
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            async with streamablehttp_client(mcp_url) as (read, write, _):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    logger.info("MCP client session established.")
+
+                    tools_result = await session.list_tools()
+                    mcp_tools = tools_result.tools
+                    logger.info(
+                        "Discovered %d MCP tools on attempt %d: %s",
+                        len(mcp_tools),
+                        attempt,
+                        [t.name for t in mcp_tools],
+                    )
+
+                    yield session, mcp_tools
+                    return
+        except Exception as exc:
+            last_exception = exc
+            if attempt < max_retries:
+                wait_time = initial_wait_seconds * (2 ** (attempt - 1))
+                logger.warning(
+                    "MCP connection failed (attempt %d/%d): %s. Retrying in %.1fs...",
+                    attempt,
+                    max_retries,
+                    exc,
+                    wait_time,
+                )
+                await asyncio.sleep(wait_time)
+            else:
+                logger.error(
+                    "MCP connection failed after %d attempts: %s",
+                    max_retries,
+                    exc,
+                    exc_info=True,
+                )
+
+    raise RuntimeError(
+        f"Failed to connect to MCP server after {max_retries} attempts"
+    ) from last_exception
+
+
+class ServiceContainer:
+    _instance: "ServiceContainer | None" = None
+
+    def __init__(
+        self,
+        ollama_client: Client,
+        mcp_session: ClientSession,
+        pg_dsn: str,
+        mcp_tools: list[Tool],
+        thread_pool: ThreadPoolExecutor,
+    ) -> None:
+        self.ollama_client = ollama_client
+        self.mcp_session = mcp_session
+        self.pg_dsn = pg_dsn
+        self.mcp_tools = mcp_tools
+        self.thread_pool = thread_pool
+
+    @classmethod
+    def initialise(
+        cls,
+        ollama_client: Client,
+        mcp_session: ClientSession,
+        pg_dsn: str,
+        mcp_tools: list[Tool],
+        thread_pool: ThreadPoolExecutor,
+    ) -> "ServiceContainer":
+        cls._instance = cls(
+            ollama_client=ollama_client,
+            mcp_session=mcp_session,
+            pg_dsn=pg_dsn,
+            mcp_tools=mcp_tools,
+            thread_pool=thread_pool,
+        )
+        return cls._instance
+
+    @classmethod
+    def get(cls) -> "ServiceContainer":
+        if cls._instance is None:
+            raise RuntimeError("Services not initialised")
+        return cls._instance
+
+    @classmethod
+    def reset(cls) -> None:
+        cls._instance = None
+
+    @classmethod
+    def get_or_none(cls) -> "ServiceContainer | None":
+        return cls._instance
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    """Create shared services on startup and clean up on shutdown."""
-    global _mem0, _ollama_client, _rag_store, _pg_dsn
+    """Connect to shared services on startup and disconnect on shutdown."""
+    logger.info("Starting server, connecting to services...")
 
-    logger.info("Starting server, initialising services...")
-
-    mem0_config = {
-        "vector_store": {
-            "provider": "pgvector",
-            "config": {
-                "host": settings.pg_host,
-                "port": settings.pg_port,
-                "user": settings.pg_user,
-                "password": settings.pg_password,
-                "dbname": settings.pg_database,
-                "collection_name": settings.mem0_collection_name,
-                "embedding_model_dims": 768,
-            },
-        },
-        "embedder": {
-            "provider": "ollama",
-            "config": {
-                "model": settings.rag_ollama_model,
-                "ollama_base_url": settings.ollama_base_url,
-                "embedding_dims": 768,
-            },
-        },
-        "llm": {
-            "provider": "ollama",
-            "config": {
-                "model": settings.server_ollama_model,
-                "ollama_base_url": settings.ollama_base_url,
-                "temperature": 0.1,
-            },
-        },
-    }
-    logger.debug("Initialising Mem0 with config: %s", mem0_config)
-    try:
-        _mem0 = Memory.from_config(mem0_config)
-        logger.info(
-            "Mem0 memory initialised successfully (collection=%s).",
-            settings.mem0_collection_name,
-        )
-    except Exception as exc:
-        logger.error("Failed to initialise Mem0: %s", exc, exc_info=True)
-        raise
-
-    # Ensure the verbatim sliding-window table exists in PostgreSQL.
-    _pg_dsn = (
-        f"host={settings.pg_host} port={settings.pg_port} "
-        f"dbname={settings.pg_database} user={settings.pg_user} "
-        f"password={settings.pg_password}"
-    )
-    _init_pool(_pg_dsn)
-    ensure_turns_table(_pg_dsn)
-
-    _ollama_client = Client(host=settings.ollama_base_url)
+    ollama_client = Client(host=settings.ollama_base_url)
     logger.info("Ollama client initialised (host=%s).", settings.ollama_base_url)
 
-    if settings.server_enable_rag:
-        try:
-            from sqlalchemy import create_engine
+    pg_dsn = build_pg_dsn(settings)
+    init_pool(pg_dsn)
+    ensure_turns_table(pg_dsn)
+    logger.info("PostgreSQL pool and schema ready.")
 
-            _rag_engine = create_engine(settings.db_url)
-            embeddings = OllamaEmbeddings(
-                base_url=settings.ollama_base_url,
-                model=settings.rag_ollama_model,
+    thread_pool = ThreadPoolExecutor()
+
+    mcp_url = f"{settings.mcp_server_url}/mcp"
+    logger.info("Connecting to MCP server at %s...", mcp_url)
+    try:
+        async with _mcp_session_with_retries(mcp_url) as (session, mcp_tools):
+            ServiceContainer.initialise(
+                ollama_client=ollama_client,
+                mcp_session=session,
+                pg_dsn=pg_dsn,
+                mcp_tools=mcp_tools,
+                thread_pool=thread_pool,
             )
-            _rag_store = PGVector(
-                connection=_rag_engine,
-                embeddings=embeddings,
-                collection_name=settings.pg_collection_name,
-            )
-            logger.info(
-                "PGVector RAG store initialised (collection=%s).",
-                settings.pg_collection_name,
-            )
-        except Exception as exc:
-            logger.warning(
-                "Failed to initialise RAG store, running without RAG: %s", exc
-            )
-            _rag_store = None
-    else:
-        logger.info("RAG disabled (SERVER_ENABLE_RAG=false).")
 
-    yield
-
-    logger.info("Server shutting down.")
-    _close_pool()
-
-
-def get_mem0() -> Memory:
-    if _mem0 is None:
-        raise RuntimeError("Mem0 not initialised")
-    return _mem0
+            yield
+    except Exception as exc:
+        logger.error("Failed to connect to MCP server: %s", exc, exc_info=True)
+        raise
+    finally:
+        ServiceContainer.reset()
+        thread_pool.shutdown(wait=True)
+        close_pool()
+        logger.info("Server shut down.")
 
 
 def get_ollama_client() -> Client:
-    if _ollama_client is None:
-        raise RuntimeError("Ollama client not initialised")
-    return _ollama_client
+    container = ServiceContainer.get_or_none()
+    if container is None:
+        raise HTTPException(status_code=503, detail="services not initialised")
+    return container.ollama_client
 
 
-def get_rag_store() -> PGVector | None:
-    return _rag_store
+def get_mcp_session() -> ClientSession:
+    container = ServiceContainer.get_or_none()
+    if container is None:
+        raise HTTPException(status_code=503, detail="services not initialised")
+    return container.mcp_session
 
 
 def get_pg_dsn() -> str:
-    if _pg_dsn is None:
-        raise RuntimeError("PostgreSQL DSN not initialised")
-    return _pg_dsn
+    container = ServiceContainer.get_or_none()
+    if container is None:
+        raise HTTPException(status_code=503, detail="services not initialised")
+    return container.pg_dsn
 
 
-Mem0Dep = Annotated[Memory, Depends(get_mem0)]
+def _is_internal_tool(tool: Tool) -> bool:
+    """Return True if the tool is tagged as internal infrastructure.
+
+    Internal tools are called directly by the server and should never be
+    described to the model.  FastMCP encodes tags in tool.meta under the
+    key ``fastmcp.tags``; any tool carrying the ``"internal"`` tag is
+    excluded from the model-facing tool list.
+    """
+    tags = (tool.meta or {}).get("fastmcp", {}).get("tags", [])
+    return "internal" in tags
+
+
+def get_mcp_tools() -> list[Tool]:
+    container = ServiceContainer.get_or_none()
+    if container is None:
+        return []
+    return [t for t in container.mcp_tools if not _is_internal_tool(t)]
+
+
+def get_thread_pool() -> ThreadPoolExecutor:
+    container = ServiceContainer.get_or_none()
+    if container is None:
+        raise HTTPException(status_code=503, detail="services not initialised")
+    return container.thread_pool
+
+
 OllamaClientDep = Annotated[Client, Depends(get_ollama_client)]
-RagStoreDep = Annotated[PGVector | None, Depends(get_rag_store)]
+McpSessionDep = Annotated[ClientSession, Depends(get_mcp_session)]
 PgDsnDep = Annotated[str, Depends(get_pg_dsn)]
+McpToolsDep = Annotated[list[Tool], Depends(get_mcp_tools)]
+ThreadPoolDep = Annotated[ThreadPoolExecutor, Depends(get_thread_pool)]

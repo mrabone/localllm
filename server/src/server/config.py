@@ -1,5 +1,4 @@
 from pydantic import Field
-from pydantic_settings import SettingsConfigDict
 
 from common.config import SharedSettings
 
@@ -12,16 +11,17 @@ class Settings(SharedSettings):
     management, RAG retrieval behaviour, and the HTTP server binding.
     """
 
-    model_config = SettingsConfigDict(
-        env_file=".env",
-        env_file_encoding="utf-8",
-        extra="ignore",
-    )
-
     # HTTP server
     server_host: str = Field(default="0.0.0.0", alias="SERVER_HOST")
     server_port: int = Field(default=8000, alias="SERVER_PORT")
     server_reload: bool = Field(default=False, alias="SERVER_RELOAD")
+
+    # MCP server connection
+    mcp_server_url: str = Field(
+        default="http://127.0.0.1:8001",
+        alias="MCP_SERVER_URL",
+        description="Base URL of the MCP server that owns RAG and memory tools.",
+    )
 
     # Chat model
     server_ollama_model: str = Field(
@@ -40,8 +40,7 @@ class Settings(SharedSettings):
         alias="SERVER_MEMORY_WINDOW_SIZE",
         description=(
             "Number of verbatim turns (user + assistant messages) kept in the "
-            "sliding window persisted in PostgreSQL. Older turns are discarded. "
-            "Replaces the old SERVER_MEMORY_MAX_MESSAGES setting."
+            "sliding window persisted in PostgreSQL. Older turns are discarded."
         ),
     )
     server_memory_long_term_max: int = Field(
@@ -52,18 +51,13 @@ class Settings(SharedSettings):
             "messages at the top of the context on every turn."
         ),
     )
-
-    # RAG retrieval
-    server_enable_rag: bool = Field(default=False, alias="SERVER_ENABLE_RAG")
-    server_rag_k: int = Field(
+    server_tool_call_max_loops: int = Field(
         default=3,
-        alias="SERVER_RAG_K",
-        description="Number of candidate documents to retrieve from PGVector.",
-    )
-    server_rag_max_distance: float = Field(
-        default=0.5,
-        alias="SERVER_RAG_MAX_DISTANCE",
-        description="Maximum cosine distance for a retrieved document to be included in context.",
+        alias="SERVER_TOOL_CALL_MAX_LOOPS",
+        description=(
+            "Maximum number of tool-calling rounds the LLM is allowed per turn "
+            "before being forced to produce a plain-text answer."
+        ),
     )
 
 

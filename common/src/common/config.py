@@ -27,10 +27,19 @@ class SharedSettings(BaseSettings):
         default="embeddinggemma",
         alias="RAG_OLLAMA_MODEL",
     )
+    mem0_llm_model: str = Field(
+        default="custom-chatbot-model",
+        alias="MEM0_LLM_MODEL",
+        description=(
+            "Ollama model used by Mem0's internal LLM pass when extracting and "
+            "summarising facts from messages.  Must be a chat-capable model, not "
+            "an embedding model."
+        ),
+    )
 
     # PostgreSQL / PGVector
     pg_host: str = Field(default="127.0.0.1", alias="PG_HOST")
-    pg_port: str = Field(default="5432", alias="PG_PORT")
+    pg_port: int = Field(default=5432, alias="PG_PORT")
     pg_database: str = Field(default="rag_db", alias="PG_DATABASE")
     pg_user: str = Field(default="user", alias="PG_USER")
     pg_password: str = Field(default="password", alias="PG_PASSWORD")
@@ -41,6 +50,18 @@ class SharedSettings(BaseSettings):
     mem0_collection_name: str = Field(
         default="mem0_chat",
         alias="MEM0_COLLECTION_NAME",
+    )
+
+    # RAG retrieval — shared by the MCP server and any other consumer
+    rag_k: int = Field(
+        default=3,
+        alias="RAG_K",
+        description="Number of candidate documents to retrieve from PGVector.",
+    )
+    rag_max_distance: float = Field(
+        default=0.5,
+        alias="RAG_MAX_DISTANCE",
+        description="Maximum cosine distance for a retrieved document to be included in context.",
     )
 
     @property
