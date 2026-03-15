@@ -39,7 +39,7 @@ class SharedSettings(BaseSettings):
 
     # PostgreSQL / PGVector
     pg_host: str = Field(default="127.0.0.1", alias="PG_HOST")
-    pg_port: str = Field(default="5432", alias="PG_PORT")
+    pg_port: int = Field(default=5432, alias="PG_PORT")
     pg_database: str = Field(default="rag_db", alias="PG_DATABASE")
     pg_user: str = Field(default="user", alias="PG_USER")
     pg_password: str = Field(default="password", alias="PG_PASSWORD")

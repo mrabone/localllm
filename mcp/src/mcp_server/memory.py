@@ -1,16 +1,16 @@
 import logging
 import uuid
-from typing import Any
 
 import psycopg2.extras
 from mem0 import Memory
 
-from common.db_pool import _close_pool, _get_conn, _init_pool
+from common.db_pool import get_conn
+from common.session_store import create_session, ensure_turns_table, session_exists
 
 logger = logging.getLogger(__name__)
 
 
-def _normalise_mem0_results(results: Any) -> list[dict]:
+def _normalise_mem0_results(results) -> list[dict]:
     """Unwrap the Mem0 API response into a plain list of memory dicts.
 
     Mem0's PGVector provider returns results in several shapes depending on
@@ -35,47 +35,6 @@ def _extract_memory_content(m: dict) -> str | None:
     return m.get("memory") or m.get("content") or m.get("data") or m.get("text")
 
 
-_CREATE_SESSIONS_TABLE = """
-CREATE TABLE IF NOT EXISTS chat_sessions (
-    id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-"""
-
-_CREATE_TURNS_TABLE = """
-CREATE TABLE IF NOT EXISTS conversation_turns (
-    id          BIGSERIAL PRIMARY KEY,
-    session_id  UUID      NOT NULL,
-    role        TEXT      NOT NULL,
-    content     TEXT      NOT NULL,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-"""
-
-_CREATE_TURNS_INDEX = """
-CREATE INDEX IF NOT EXISTS conversation_turns_session_id_id_idx
-    ON conversation_turns (session_id, id);
-"""
-
-
-def ensure_turns_table(dsn: str) -> None:
-    """Create the chat_sessions, conversation_turns table and index if they do not exist.
-
-    Safe to call multiple times (uses IF NOT EXISTS).  Intended to be called
-    once during server lifespan startup.
-    """
-    logger.info("Ensuring chat_sessions and conversation_turns tables exist.")
-    try:
-        with _get_conn(dsn) as conn, conn.cursor() as cur:
-            cur.execute(_CREATE_SESSIONS_TABLE)
-            cur.execute(_CREATE_TURNS_TABLE)
-            cur.execute(_CREATE_TURNS_INDEX)
-        logger.info("chat_sessions and conversation_turns tables ready.")
-    except Exception as exc:
-        logger.error("Failed to create tables: %s", exc, exc_info=True)
-        raise
-
-
 def append_turn(dsn: str, session_id: uuid.UUID, role: str, content: str) -> None:
     """Insert a single verbatim turn into the sliding-window table.
 
@@ -90,7 +49,7 @@ def append_turn(dsn: str, session_id: uuid.UUID, role: str, content: str) -> Non
         len(content),
     )
     try:
-        with _get_conn(dsn) as conn, conn.cursor() as cur:
+        with get_conn(dsn) as conn, conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO conversation_turns (session_id, role, content) "
                 "VALUES (%s, %s, %s)",
@@ -122,7 +81,7 @@ def load_window(
     )
     try:
         with (
-            _get_conn(dsn) as conn,
+            get_conn(dsn) as conn,
             conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur,
         ):
             cur.execute(
@@ -155,41 +114,6 @@ def load_window(
         return []
 
 
-def create_session(dsn: str) -> uuid.UUID:
-    """Create a new session row in chat_sessions and return its UUID."""
-    session_id = uuid.uuid4()
-    logger.info("Creating new session: %s", session_id)
-    try:
-        with _get_conn(dsn) as conn, conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO chat_sessions (id) VALUES (%s)",
-                (str(session_id),),
-            )
-        logger.info("Session %s created in chat_sessions.", session_id)
-    except Exception as exc:
-        logger.error("Failed to create session %s: %s", session_id, exc, exc_info=True)
-        raise
-    return session_id
-
-
-def session_exists(dsn: str, session_id: uuid.UUID) -> bool:
-    """Return True if the session row exists in chat_sessions."""
-    str_session_id = str(session_id)
-    logger.debug("Checking if session exists: %s", str_session_id)
-    try:
-        with _get_conn(dsn) as conn, conn.cursor() as cur:
-            cur.execute(
-                "SELECT 1 FROM chat_sessions WHERE id = %s LIMIT 1",
-                (str_session_id,),
-            )
-            exists = cur.fetchone() is not None
-        logger.info("Session %s exists: %s", str_session_id, exists)
-        return exists
-    except Exception as exc:
-        logger.error("Error checking session existence: %s", exc, exc_info=True)
-        return False
-
-
 def save_message(mem0: Memory, session_id: uuid.UUID, role: str, content: str) -> None:
     """Persist a single message to Mem0.
 
@@ -220,113 +144,6 @@ def save_message(mem0: Memory, session_id: uuid.UUID, role: str, content: str) -
         raise
 
 
-def load_messages(
-    mem0: Memory, session_id: uuid.UUID, query: str, max_messages: int = 10
-) -> list[dict[str, str]]:
-    """Retrieve semantically relevant memories for the given query.
-
-    NOTE: This function is used exclusively by the ``GET /sessions/{id}``
-    history-viewing endpoint.  The chat path does **not** call it — it uses
-    ``load_long_term_memories`` (layer 1) and ``load_window`` (layer 2)
-    instead.
-
-    Returns a list of dicts with ``role`` and ``content`` keys, ready to pass
-    directly into the Ollama chat messages list.  If ``query`` is empty all
-    stored memories are returned via ``get_all``.
-
-    At most ``max_messages`` entries are returned.  Mem0 already ranks results
-    by relevance, so truncating the tail discards the least-relevant memories
-    and keeps the context window from growing without bound.
-    """
-    str_session_id = str(session_id)
-    logger.debug(
-        "Loading messages from Mem0: session=%s, query='%s'",
-        str_session_id,
-        query[:100] if query else "(empty)",
-    )
-
-    try:
-        if not query:
-            logger.debug("Query is empty, calling get_all()")
-            raw = mem0.get_all(user_id=str_session_id)
-            logger.debug(
-                "get_all() returned: type=%s, len=%d",
-                type(raw),
-                len(raw) if isinstance(raw, (list, dict)) else 0,
-            )
-            memories = _normalise_mem0_results(raw)
-            logger.debug(
-                "After normalization: memories type=%s, len=%d",
-                type(memories),
-                len(memories),
-            )
-        else:
-            logger.debug("Query is non-empty, calling search()")
-            raw = mem0.search(query, user_id=str_session_id)
-            logger.debug(
-                "search() returned: type=%s, len=%d",
-                type(raw),
-                len(raw) if isinstance(raw, (list, dict)) else 0,
-            )
-            memories = _normalise_mem0_results(raw)
-
-        # Build standard {role, content} dicts from normalised memory entries.
-        messages = []
-        for m in memories:
-            if not isinstance(m, dict):
-                logger.debug("Skipping non-dict memory item: %s", type(m))
-                continue
-
-            memory_content = _extract_memory_content(m)
-            memory_role = m.get("role", "system")
-
-            if memory_content:
-                messages.append({"role": memory_role, "content": memory_content})
-                logger.debug(
-                    "Added memory: role=%s, content_len=%d",
-                    memory_role,
-                    len(str(memory_content)),
-                )
-            else:
-                logger.debug(
-                    "Could not extract memory content from item with keys: %s",
-                    list(m.keys()),
-                )
-
-        logger.info(
-            "Loaded %d memories from Mem0 (session=%s, query_len=%d)",
-            len(messages),
-            str_session_id,
-            len(query),
-        )
-        if messages:
-            logger.debug(
-                "Sample memory: role=%s, content=%s...",
-                messages[0].get("role"),
-                str(messages[0].get("content"))[:50],
-            )
-
-        if len(messages) > max_messages:
-            logger.debug(
-                "Capping memories from %d to %d (max_messages=%d)",
-                len(messages),
-                max_messages,
-                max_messages,
-            )
-            messages = messages[:max_messages]
-
-        return messages
-    except Exception as exc:
-        logger.error(
-            "Error loading messages from Mem0: session=%s, query='%s': %s",
-            str_session_id,
-            query[:100] if query else "(empty)",
-            exc,
-            exc_info=True,
-        )
-        return []
-
-
 def load_long_term_memories(
     mem0: Memory, session_id: uuid.UUID, long_term_max: int = 3
 ) -> list[dict[str, str]]:
@@ -351,12 +168,6 @@ def load_long_term_memories(
     )
     try:
         raw = mem0.get_all(user_id=str_session_id)
-        logger.debug(
-            "get_all() returned: type=%s, len=%d",
-            type(raw),
-            len(raw) if isinstance(raw, (list, dict)) else 0,
-        )
-
         memories = _normalise_mem0_results(raw)
 
         facts: list[str] = []
@@ -368,11 +179,6 @@ def load_long_term_memories(
                 facts.append(str(memory_content))
 
         if len(facts) > long_term_max:
-            logger.debug(
-                "Capping long-term memories from %d to %d",
-                len(facts),
-                long_term_max,
-            )
             facts = facts[:long_term_max]
 
         logger.info(
@@ -400,3 +206,14 @@ def load_long_term_memories(
             exc_info=True,
         )
         return []
+
+
+__all__ = [
+    "append_turn",
+    "create_session",
+    "ensure_turns_table",
+    "load_long_term_memories",
+    "load_window",
+    "save_message",
+    "session_exists",
+]

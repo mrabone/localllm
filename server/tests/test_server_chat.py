@@ -66,32 +66,45 @@ class TestChatTokenStream:
             ]
         )
 
-        stream, _ = await session.chat("hi")
+        stream = await session.chat("hi")
         tokens = [t async for t in stream]
 
-        assert tokens == ["Hello", " world"]
+        assert "".join(tokens) == "Hello world"
 
-    async def test_rag_used_false_when_search_returns_empty(self):
-        """rag_used is False when search_knowledge_base returns an empty string."""
+    async def test_rag_not_called_when_search_returns_empty(self):
+        """search_knowledge_base is not called when mcp_tools is empty."""
         session = _make_session()
-        session.mcp_session.call_tool = _stub_call_tool({"search_knowledge_base": ""})
+        call_tool_mock = _stub_call_tool({})
+        session.mcp_session.call_tool = call_tool_mock
         session.client.chat.return_value = iter([{"message": {"content": "ok"}}])
 
-        _, rag_used = await session.chat("hello")
+        stream = await session.chat("hello")
+        async for _ in stream:
+            pass
 
-        assert rag_used is False
+        search_calls = [
+            c
+            for c in call_tool_mock.await_args_list
+            if c.args[0] == "search_knowledge_base"
+        ]
+        assert len(search_calls) == 0
 
-    async def test_rag_used_true_when_search_returns_content(self):
-        """rag_used is True when search_knowledge_base returns a non-empty string."""
+    async def test_infrastructure_tools_called_unconditionally(self):
+        """load_long_term_memory, load_conversation_window and persist_message
+        are always called even when no mcp_tools are configured."""
         session = _make_session()
-        session.mcp_session.call_tool = _stub_call_tool(
-            {"search_knowledge_base": "some document context"}
-        )
+        call_tool_mock = _stub_call_tool({})
+        session.mcp_session.call_tool = call_tool_mock
         session.client.chat.return_value = iter([{"message": {"content": "ok"}}])
 
-        _, rag_used = await session.chat("hello")
+        stream = await session.chat("hello")
+        async for _ in stream:
+            pass
 
-        assert rag_used is True
+        called_names = {c.args[0] for c in call_tool_mock.await_args_list}
+        assert "load_long_term_memory" in called_names
+        assert "load_conversation_window" in called_names
+        assert "persist_message" in called_names
 
 
 @pytest.mark.asyncio
@@ -102,7 +115,7 @@ class TestContextMessageOrder:
         session.mcp_session.call_tool = _stub_call_tool({})
         session.client.chat.return_value = iter([{"message": {"content": "ok"}}])
 
-        stream, _ = await session.chat("hello")
+        stream = await session.chat("hello")
         async for _ in stream:
             pass
 
@@ -110,26 +123,13 @@ class TestContextMessageOrder:
         assert messages[0]["role"] == "system"
         assert "helpful assistant" in messages[0]["content"]
 
-    async def test_user_turn_is_last(self):
-        """The current user input must always be the final message."""
-        session = _make_session()
-        session.mcp_session.call_tool = _stub_call_tool({})
-        session.client.chat.return_value = iter([{"message": {"content": "ok"}}])
-
-        stream, _ = await session.chat("my question")
-        async for _ in stream:
-            pass
-
-        messages = session.client.chat.call_args[1]["messages"]
-        assert messages[-1] == {"role": "user", "content": "my question"}
-
     async def test_no_extra_messages_when_context_empty(self):
         """With no long-term memory, no window, and no RAG: orientation + user = 2 messages."""
         session = _make_session()
         session.mcp_session.call_tool = _stub_call_tool({})
         session.client.chat.return_value = iter([{"message": {"content": "ok"}}])
 
-        stream, _ = await session.chat("hello")
+        stream = await session.chat("hello")
         async for _ in stream:
             pass
 
@@ -146,7 +146,7 @@ class TestContextMessageOrder:
         )
         session.client.chat.return_value = iter([{"message": {"content": "ok"}}])
 
-        stream, _ = await session.chat("hello")
+        stream = await session.chat("hello")
         async for _ in stream:
             pass
 
@@ -171,7 +171,7 @@ class TestContextMessageOrder:
         )
         session.client.chat.return_value = iter([{"message": {"content": "ok"}}])
 
-        stream, _ = await session.chat("current question")
+        stream = await session.chat("current question")
         async for _ in stream:
             pass
 
@@ -179,26 +179,21 @@ class TestContextMessageOrder:
         assert messages[2] == {"role": "user", "content": "prev question"}
         assert messages[3] == {"role": "assistant", "content": "prev answer"}
 
-    async def test_rag_system_message_injected_before_user_turn(self):
-        """RAG context appears as a system message immediately before the user turn."""
+    async def test_user_turn_is_always_last_without_tools(self):
+        """The current user turn is the final message when no mcp_tools are configured."""
         session = _make_session()
-        session.mcp_session.call_tool = _stub_call_tool(
-            {"search_knowledge_base": "relevant doc content"}
-        )
+        session.mcp_session.call_tool = _stub_call_tool({})
         session.client.chat.return_value = iter([{"message": {"content": "ok"}}])
 
-        stream, _ = await session.chat("my question")
+        stream = await session.chat("my question")
         async for _ in stream:
             pass
 
         messages = session.client.chat.call_args[1]["messages"]
         assert messages[-1] == {"role": "user", "content": "my question"}
-        rag_msg = messages[-2]
-        assert rag_msg["role"] == "system"
-        assert "relevant doc content" in rag_msg["content"]
 
     async def test_full_context_order(self):
-        """Full order: orientation → long_term → window → rag system msg → user."""
+        """Full order: orientation → long_term → window → user."""
         window_turns = [
             {"role": "user", "content": "prev q"},
             {"role": "assistant", "content": "prev a"},
@@ -208,12 +203,11 @@ class TestContextMessageOrder:
             {
                 "load_long_term_memory": "memory facts",
                 "load_conversation_window": json.dumps(window_turns),
-                "search_knowledge_base": "rag docs",
             }
         )
         session.client.chat.return_value = iter([{"message": {"content": "ok"}}])
 
-        stream, _ = await session.chat("current q")
+        stream = await session.chat("current q")
         async for _ in stream:
             pass
 
@@ -223,10 +217,8 @@ class TestContextMessageOrder:
         assert messages[1] == {"role": "system", "content": "memory facts"}
         assert messages[2] == {"role": "user", "content": "prev q"}
         assert messages[3] == {"role": "assistant", "content": "prev a"}
-        assert messages[4]["role"] == "system"
-        assert "rag docs" in messages[4]["content"]
-        assert messages[5] == {"role": "user", "content": "current q"}
-        assert len(messages) == 6
+        assert messages[4] == {"role": "user", "content": "current q"}
+        assert len(messages) == 5
 
 
 @pytest.mark.asyncio
@@ -243,7 +235,7 @@ class TestMcpToolCallArgs:
             mock_settings.server_ollama_num_ctx = 8192
             mock_settings.server_memory_long_term_max = 5
             mock_settings.server_memory_window_size = 10
-            stream, _ = await session.chat("hello")
+            stream = await session.chat("hello")
             async for _ in stream:
                 pass
 
@@ -264,7 +256,7 @@ class TestMcpToolCallArgs:
             mock_settings.server_ollama_num_ctx = 8192
             mock_settings.server_memory_long_term_max = 3
             mock_settings.server_memory_window_size = 7
-            stream, _ = await session.chat("hello")
+            stream = await session.chat("hello")
             async for _ in stream:
                 pass
 
@@ -284,7 +276,7 @@ class TestMcpToolCallArgs:
             mock_settings.server_ollama_num_ctx = 4096
             mock_settings.server_memory_long_term_max = 3
             mock_settings.server_memory_window_size = 10
-            stream, _ = await session.chat("hello")
+            stream = await session.chat("hello")
             async for _ in stream:
                 pass
 
@@ -298,7 +290,7 @@ class TestMcpToolCallArgs:
         session.mcp_session.call_tool = call_tool_mock
         session.client.chat.return_value = iter([{"message": {"content": "ok"}}])
 
-        stream, _ = await session.chat("user input")
+        stream = await session.chat("user input")
         async for _ in stream:
             pass
 
@@ -324,7 +316,7 @@ class TestMcpToolCallArgs:
             ]
         )
 
-        stream, _ = await session.chat("hi")
+        stream = await session.chat("hi")
         async for _ in stream:
             pass
 
@@ -349,7 +341,7 @@ class TestEdgeCases:
         )
         session.client.chat.return_value = iter([{"message": {"content": "ok"}}])
 
-        stream, _ = await session.chat("hello")
+        stream = await session.chat("hello")
         async for _ in stream:
             pass
 
@@ -372,7 +364,7 @@ class TestEdgeCases:
         session.mcp_session.call_tool = AsyncMock(side_effect=_failing_call_tool)
         session.client.chat.return_value = iter([{"message": {"content": "ok"}}])
 
-        stream, _ = await session.chat("hello")
+        stream = await session.chat("hello")
         tokens = [t async for t in stream]
 
-        assert tokens == ["ok"]
+        assert "".join(tokens) == "ok"

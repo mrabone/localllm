@@ -1,29 +1,55 @@
 import logging
 
 from fastmcp import FastMCP
-from fastmcp.server.lifespan import lifespan
+from fastmcp.server.lifespan import lifespan as fastmcp_lifespan
 from langchain_ollama import OllamaEmbeddings
 from langchain_postgres import PGVector
 from mem0 import Memory
 
 from common.db import build_pg_dsn
-from common.db_pool import _close_pool, _init_pool
+from common.db_pool import close_pool, init_pool
+from common.session_store import ensure_turns_table
 from mcp_server.config import settings
-from mcp_server.memory import ensure_turns_table
 
 logger = logging.getLogger(__name__)
 
-# Module-level singletons populated during lifespan startup.
-_mem0: Memory | None = None
-_rag_store: PGVector | None = None
-_pg_dsn: str | None = None
+
+class ServiceContainer:
+    _instance: "ServiceContainer | None" = None
+
+    def __init__(self, mem0: Memory, pg_dsn: str, rag_store: PGVector | None) -> None:
+        self.mem0 = mem0
+        self.pg_dsn = pg_dsn
+        self.rag_store = rag_store
+
+    @classmethod
+    def initialise(
+        cls,
+        mem0: Memory,
+        pg_dsn: str,
+        rag_store: PGVector | None,
+    ) -> "ServiceContainer":
+        cls._instance = cls(mem0=mem0, pg_dsn=pg_dsn, rag_store=rag_store)
+        return cls._instance
+
+    @classmethod
+    def get(cls) -> "ServiceContainer":
+        if cls._instance is None:
+            raise RuntimeError("Services not initialised")
+        return cls._instance
+
+    @classmethod
+    def reset(cls) -> None:
+        cls._instance = None
+
+    @classmethod
+    def get_or_none(cls) -> "ServiceContainer | None":
+        return cls._instance
 
 
-@lifespan
+@fastmcp_lifespan
 async def lifespan(server: FastMCP):
     """Initialise shared services on startup and release them on shutdown."""
-    global _mem0, _rag_store, _pg_dsn
-
     logger.info("Starting MCP server, initialising services...")
 
     mem0_config = {
@@ -58,16 +84,17 @@ async def lifespan(server: FastMCP):
     }
 
     try:
-        _mem0 = Memory.from_config(mem0_config)
+        mem0 = Memory.from_config(mem0_config)
         logger.info("Mem0 initialised (collection=%s).", settings.mem0_collection_name)
     except Exception as exc:
         logger.error("Failed to initialise Mem0: %s", exc, exc_info=True)
         raise
 
-    _pg_dsn = build_pg_dsn(settings)
-    _init_pool(_pg_dsn)
-    ensure_turns_table(_pg_dsn)
+    pg_dsn = build_pg_dsn(settings)
+    init_pool(pg_dsn)
+    ensure_turns_table(pg_dsn)
 
+    rag_store: PGVector | None = None
     if settings.mcp_enable_rag:
         try:
             from sqlalchemy import create_engine
@@ -77,7 +104,7 @@ async def lifespan(server: FastMCP):
                 base_url=settings.ollama_base_url,
                 model=settings.rag_ollama_model,
             )
-            _rag_store = PGVector(
+            rag_store = PGVector(
                 connection=_rag_engine,
                 embeddings=embeddings,
                 collection_name=settings.pg_collection_name,
@@ -90,28 +117,29 @@ async def lifespan(server: FastMCP):
             logger.warning(
                 "Failed to initialise RAG store, running without RAG: %s", exc
             )
-            _rag_store = None
     else:
         logger.info("RAG disabled (MCP_ENABLE_RAG=false).")
+
+    ServiceContainer.initialise(mem0=mem0, pg_dsn=pg_dsn, rag_store=rag_store)
 
     try:
         yield
     finally:
         logger.info("MCP server shutting down.")
-        _close_pool()
+        ServiceContainer.reset()
+        close_pool()
 
 
 def get_mem0() -> Memory:
-    if _mem0 is None:
-        raise RuntimeError("Mem0 not initialised")
-    return _mem0
+    return ServiceContainer.get().mem0
 
 
 def get_rag_store() -> PGVector | None:
-    return _rag_store
+    container = ServiceContainer.get_or_none()
+    if container is None:
+        return None
+    return container.rag_store
 
 
 def get_pg_dsn() -> str:
-    if _pg_dsn is None:
-        raise RuntimeError("PostgreSQL DSN not initialised")
-    return _pg_dsn
+    return ServiceContainer.get().pg_dsn

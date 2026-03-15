@@ -14,6 +14,10 @@ from server.config import settings
 
 logger = logging.getLogger(__name__)
 
+TOOL_LOAD_LONG_TERM_MEMORY = "load_long_term_memory"
+TOOL_LOAD_CONVERSATION_WINDOW = "load_conversation_window"
+TOOL_PERSIST_MESSAGE = "persist_message"
+
 
 class Role(Enum):
     USER = "user"
@@ -243,7 +247,7 @@ class ChatSession:
 
         long_term_task = asyncio.create_task(
             self._call_tool(
-                "load_long_term_memory",
+                TOOL_LOAD_LONG_TERM_MEMORY,
                 {
                     "session_id": session_id_str,
                     "long_term_max": settings.server_memory_long_term_max,
@@ -252,7 +256,7 @@ class ChatSession:
         )
         window_task = asyncio.create_task(
             self._call_tool(
-                "load_conversation_window",
+                TOOL_LOAD_CONVERSATION_WINDOW,
                 {
                     "session_id": session_id_str,
                     "window_size": settings.server_memory_window_size,
@@ -261,7 +265,7 @@ class ChatSession:
         )
         persist_user_task = asyncio.create_task(
             self._call_tool(
-                "persist_message",
+                TOOL_PERSIST_MESSAGE,
                 {
                     "session_id": session_id_str,
                     "role": Role.USER.value,
@@ -363,18 +367,21 @@ class ChatSession:
                     assembled += char
                     yield char
             else:
+                # Loop cap hit: buffer all tokens before yielding so we can
+                # detect tool-call JSON and intercept it before it reaches the
+                # caller. Streaming fidelity matters less on this rare error path.
                 stream = self.client.chat(
                     model=self.model,
                     messages=messages,
                     stream=True,
                     options={"num_ctx": settings.server_ollama_num_ctx},
                 )
-                buffered_tokens: list[str] = []
+                streamed_tokens: list[str] = []
                 for chunk in stream:
                     token = chunk["message"]["content"]
-                    buffered_tokens.append(token)
+                    streamed_tokens.append(token)
 
-                streamed_text = "".join(buffered_tokens)
+                streamed_text = "".join(streamed_tokens)
 
                 if parse_tool_calls(streamed_text):
                     # The model is still trying to call tools after the loop cap.
@@ -403,13 +410,19 @@ class ChatSession:
                     assembled = forced_response["message"]["content"]
                 else:
                     assembled = streamed_text
+                    for token in streamed_tokens:
+                        yield token
+                    # assembled is set; fall through to persist without double-yielding
+                    # by returning after the persist call at the end of the function.
+                    # We use a flag to avoid re-yielding assembled below.
 
-                for char in assembled:
-                    yield char
+                if assembled != streamed_text or parse_tool_calls(streamed_text):
+                    for char in assembled:
+                        yield char
 
             try:
                 await mcp_session.call_tool(
-                    "persist_message",
+                    TOOL_PERSIST_MESSAGE,
                     arguments={
                         "session_id": session_id_str_,
                         "role": Role.ASSISTANT.value,

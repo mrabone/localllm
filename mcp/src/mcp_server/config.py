@@ -1,5 +1,4 @@
 from pydantic import Field
-from pydantic_settings import SettingsConfigDict
 
 from common.config import SharedSettings
 
@@ -12,12 +11,6 @@ class Settings(SharedSettings):
     MCP-specific settings control the HTTP binding and which optional
     services are enabled at startup.
     """
-
-    model_config = SettingsConfigDict(
-        env_file=".env",
-        env_file_encoding="utf-8",
-        extra="ignore",
-    )
 
     # HTTP server
     mcp_host: str = Field(default="0.0.0.0", alias="MCP_HOST")

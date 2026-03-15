@@ -1,5 +1,4 @@
 from pydantic import Field
-from pydantic_settings import SettingsConfigDict
 
 from common.config import SharedSettings
 
@@ -11,12 +10,6 @@ class Settings(SharedSettings):
     Server-specific settings control the chat model, conversation history
     management, RAG retrieval behaviour, and the HTTP server binding.
     """
-
-    model_config = SettingsConfigDict(
-        env_file=".env",
-        env_file_encoding="utf-8",
-        extra="ignore",
-    )
 
     # HTTP server
     server_host: str = Field(default="0.0.0.0", alias="SERVER_HOST")
@@ -47,8 +40,7 @@ class Settings(SharedSettings):
         alias="SERVER_MEMORY_WINDOW_SIZE",
         description=(
             "Number of verbatim turns (user + assistant messages) kept in the "
-            "sliding window persisted in PostgreSQL. Older turns are discarded. "
-            "Replaces the old SERVER_MEMORY_MAX_MESSAGES setting."
+            "sliding window persisted in PostgreSQL. Older turns are discarded."
         ),
     )
     server_memory_long_term_max: int = Field(

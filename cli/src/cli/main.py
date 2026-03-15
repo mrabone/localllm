@@ -1,5 +1,4 @@
 import argparse
-import json
 import sys
 
 import httpx
@@ -34,7 +33,6 @@ class ChatApplication:
         """Send user_input to the server and stream the response to stdout."""
         url = f"{settings.server_url}/sessions/{self.session_id}/chat"
 
-        rag_doc_count: int | None = None
         print(f"\n{Colors.CYAN}{Colors.BOLD}Assistant:{Colors.RESET}")
 
         with connect_sse(
@@ -42,7 +40,7 @@ class ChatApplication:
             "POST",
             url,
             json={"message": user_input},
-            timeout=None,
+            timeout=httpx.Timeout(connect=10.0, read=300.0),
         ) as event_source:
             if event_source.response.status_code != 200:
                 # Truncate the body to avoid leaking server-side stack traces
@@ -57,8 +55,6 @@ class ChatApplication:
             for sse in event_source.iter_sse():
                 if sse.event == "token":
                     print(sse.data, end="", flush=True)
-                elif sse.event == "rag":
-                    rag_doc_count = json.loads(sse.data)["document_count"]
                 elif sse.event == "error":
                     print(f"\nServer error: {sse.data}")
                     break
@@ -66,12 +62,6 @@ class ChatApplication:
                     break
 
         print("\n")
-
-        if rag_doc_count is not None:
-            print(
-                f"{Colors.CYAN}(RAG: retrieved context from "
-                f"{rag_doc_count} document(s)){Colors.RESET}\n"
-            )
 
     def run(self) -> None:
         """Run the interactive chat REPL until the user exits."""
