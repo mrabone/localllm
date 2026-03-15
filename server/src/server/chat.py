@@ -1,9 +1,13 @@
+import asyncio
+import json
 import logging
 import uuid
+from dataclasses import dataclass
 from enum import Enum
 from typing import AsyncGenerator
 
 from mcp import ClientSession
+from mcp.types import Tool
 from ollama import Client
 
 from server.config import settings
@@ -15,27 +19,149 @@ class Role(Enum):
     USER = "user"
     ASSISTANT = "assistant"
     SYSTEM = "system"
+    TOOL = "tool"
+
+
+@dataclass
+class ToolCall:
+    id: str
+    name: str
+    arguments: dict
+
+
+def build_tools_system_message(tools: list[Tool]) -> str:
+    """Build the system message that instructs the LLM how to call tools.
+
+    Renders each tool's name, description, and input schema into a plain-text
+    block the model can follow.  Returns an empty string when no tools are
+    available so the caller can skip appending it.
+    """
+    if not tools:
+        return ""
+
+    tool_descriptions = []
+    for tool in tools:
+        schema = tool.inputSchema or {}
+        properties = schema.get("properties", {})
+        required = schema.get("required", [])
+
+        params = []
+        for param_name, param_schema in properties.items():
+            param_type = param_schema.get("type", "any")
+            is_required = param_name in required
+            default = param_schema.get("default")
+            description = param_schema.get("description", "")
+
+            param_str = f"  - {param_name} ({param_type}"
+            if not is_required and default is not None:
+                param_str += f", default={default!r}"
+            param_str += ")"
+            if description:
+                param_str += f": {description}"
+            params.append(param_str)
+
+        params_block = "\n".join(params) if params else "  (no parameters)"
+        tool_descriptions.append(
+            f"### {tool.name}\n"
+            f"{tool.description or 'No description provided.'}\n"
+            f"Parameters:\n{params_block}"
+        )
+
+    tools_block = "\n\n".join(tool_descriptions)
+
+    return (
+        "## Available Tools\n\n"
+        "You may call any of the following tools when you need to retrieve "
+        "information or perform an action.  To call a tool, respond with a JSON "
+        "object — and nothing else — in exactly this format:\n\n"
+        '{"toolCalls": [{"id": "call_1", "name": "<tool_name>", "arguments": {<args>}}]}\n\n'
+        "You may include multiple tool calls in a single response.  After receiving "
+        "tool results you will be prompted again to continue your answer.\n\n"
+        "Only output the JSON when you want to call a tool.  Do not wrap it in "
+        "markdown code fences or any other formatting — raw JSON only.  "
+        "When you have enough information to answer the user, respond normally in plain text.\n\n"
+        f"{tools_block}"
+    )
+
+
+def parse_tool_calls(response_text: str) -> list[ToolCall]:
+    """Extract tool calls from an LLM response string.
+
+    The model is instructed to respond with a bare JSON object when it wants
+    to call tools.  This function attempts to parse that object and returns a
+    (possibly empty) list of ToolCall instances.
+
+    Both camelCase (``toolCalls``, ``name``, ``arguments``) and snake_case
+    (``tool_calls``, ``tool_name``, ``tool_arguments``) key variants are
+    accepted so that the parser is tolerant of models that do not strictly
+    follow the casing in the system prompt.
+
+    Malformed or non-tool-call responses return an empty list so the caller
+    can treat them as plain assistant messages.
+    """
+    stripped = response_text.strip()
+
+    if stripped.startswith("```"):
+        lines = stripped.splitlines()
+        inner_lines = [line for line in lines[1:] if line.strip() != "```"]
+        stripped = "\n".join(inner_lines).strip()
+
+    if not stripped.startswith("{"):
+        return []
+
+    try:
+        payload = json.loads(stripped)
+    except json.JSONDecodeError:
+        return []
+
+    raw_calls = payload.get("toolCalls") or payload.get("tool_calls")
+    if not isinstance(raw_calls, list):
+        return []
+
+    tool_calls = []
+    for item in raw_calls:
+        if not isinstance(item, dict):
+            continue
+        call_id = item.get("id") or str(uuid.uuid4())
+        name = item.get("name") or item.get("tool_name")
+        arguments = item.get("arguments") or item.get("tool_arguments") or {}
+        if not name or not isinstance(arguments, dict):
+            continue
+        tool_calls.append(ToolCall(id=call_id, name=name, arguments=arguments))
+
+    return tool_calls
+
+
+def build_tool_result_message(call_id: str, name: str, content: str) -> dict:
+    """Build a tool result message dictionary to be appended to the conversation."""
+    return {
+        "role": Role.TOOL.value,
+        "content": f"[Tool result for {name} (id={call_id})]\n{content}",
+    }
 
 
 class ChatSession:
     """Handles a single chat turn for a persistent session.
 
-    Context is assembled in two tiers on every turn:
+    Context is assembled in two layers on every turn:
 
-    1. **Long-term memories** (layer 1) — semantic facts extracted by Mem0
-       from previous conversations, retrieved via the MCP ``load_long_term_memory``
-       tool and injected as a ``system`` message.
+    1. **Long-term memories** — semantic facts extracted by Mem0 from previous
+       conversations, retrieved via the MCP ``load_long_term_memory`` tool and
+       injected as a ``system`` message.
 
-    2. **Sliding window** (layer 2) — the last ``window_size`` verbatim
-       user/assistant turns, retrieved via the MCP ``load_conversation_window``
-       tool.
+    2. **Sliding window** — the last ``window_size`` verbatim user/assistant
+       turns, retrieved via the MCP ``load_conversation_window`` tool.
 
-    3. **Current turn** (layer 3) — the user's input, optionally augmented
-       with RAG context retrieved via the MCP ``search_knowledge_base`` tool.
+    Both retrieval calls are issued concurrently with the user-turn persistence
+    call using ``asyncio.gather`` to minimise first-token latency.
 
-    All MCP tool calls for context retrieval are issued concurrently using
-    ``asyncio.gather`` to minimise first-token latency.  Message persistence
-    is fire-and-forget after the stream completes.
+    When MCP tools are provided via ``mcp_tools``, the LLM is given a system
+    message describing every available tool and instructed to respond with a
+    JSON ``toolCalls`` object when it wants to invoke one.  The chat method
+    will execute those calls (up to ``server_tool_call_max_loops`` rounds) and
+    feed results back before streaming the final answer.  The model may invoke
+    ``search_knowledge_base`` itself during this loop when it decides retrieval
+    is needed.
     """
 
     def __init__(
@@ -44,11 +170,13 @@ class ChatSession:
         mcp_session: ClientSession,
         ollama_client: Client,
         model: str | None = None,
+        mcp_tools: list[Tool] | None = None,
     ) -> None:
         self.session_id = session_id
         self.mcp_session = mcp_session
         self.client = ollama_client
         self.model = model if model is not None else settings.server_ollama_model
+        self.mcp_tools = mcp_tools or []
 
     async def _call_tool(self, name: str, arguments: dict) -> str:
         """Call a named MCP tool and return its first text content."""
@@ -57,19 +185,60 @@ class ChatSession:
             return result.content[0].text
         return ""
 
-    async def chat(self, user_input: str) -> tuple[AsyncGenerator[str, None], bool]:
-        """Process one user turn and return a (token_stream, rag_used) tuple.
+    async def _execute_tool_calls(self, tool_calls: list[ToolCall]) -> list[dict]:
+        """Execute a list of tool calls concurrently and return result messages.
+
+        Each call is wrapped in its own try/except so a single failure does not
+        cancel the others.  Failures are returned as error strings so the LLM
+        can decide how to proceed.
+        """
+        known_names = {t.name for t in self.mcp_tools}
+
+        async def _run_one(call: ToolCall) -> dict:
+            if call.name not in known_names:
+                available = ", ".join(sorted(known_names)) or "none"
+                error = (
+                    f"ERROR: Unknown tool '{call.name}'. "
+                    f"Available tools are: {available}"
+                )
+                return build_tool_result_message(call.id, call.name, error)
+
+            try:
+                result = await self._call_tool(call.name, call.arguments)
+                if not result:
+                    result = "No results found. Answer the user's question using your own knowledge."
+                return build_tool_result_message(call.id, call.name, result)
+            except Exception as exc:
+                logger.warning(
+                    "Tool call '%s' failed (session=%s, arguments=%s): %s",
+                    call.name,
+                    self.session_id,
+                    call.arguments,
+                    exc,
+                )
+                error = (
+                    f"ERROR: Tool '{call.name}' failed with: {exc}. "
+                    "Continue with the information you have."
+                )
+                return build_tool_result_message(call.id, call.name, error)
+
+        return list(await asyncio.gather(*(_run_one(c) for c in tool_calls)))
+
+    async def chat(self, user_input: str) -> AsyncGenerator[str, None]:
+        """Process one user turn and return a token stream.
 
         Fires three MCP tool calls concurrently to minimise pre-stream latency:
-        ``load_long_term_memory``, ``load_conversation_window``, and
-        ``search_knowledge_base``.  The user-turn persistence call is also
-        issued concurrently with the reads.
+        ``load_long_term_memory``, ``load_conversation_window``, and the
+        user-turn ``persist_message``.
 
-        Returns an async generator that yields token strings, plus a boolean
-        indicating whether RAG context was included.
+        If the session was created with ``mcp_tools``, up to
+        ``server_tool_call_max_loops`` rounds of tool calling are performed
+        before the final response is streamed back to the caller.  The model
+        may invoke ``search_knowledge_base`` itself via the tool-calling loop
+        when it decides retrieval is needed.
+
+        Returns an async generator that yields token strings.
         """
-        import asyncio
-
         session_id_str = str(self.session_id)
 
         long_term_task = asyncio.create_task(
@@ -90,9 +259,6 @@ class ChatSession:
                 },
             )
         )
-        rag_task = asyncio.create_task(
-            self._call_tool("search_knowledge_base", {"query": user_input})
-        )
         persist_user_task = asyncio.create_task(
             self._call_tool(
                 "persist_message",
@@ -104,9 +270,11 @@ class ChatSession:
             )
         )
 
-        long_term_content, window_content, rag_content, _ = await asyncio.gather(
-            long_term_task, window_task, rag_task, persist_user_task
+        long_term_content, window_content, _ = await asyncio.gather(
+            long_term_task, window_task, persist_user_task
         )
+
+        tools_guidance = build_tools_system_message(self.mcp_tools)
 
         orientation = {
             "role": Role.SYSTEM.value,
@@ -119,7 +287,7 @@ class ChatSession:
                 "- Knowledge base documents: relevant documents retrieved for this "
                 "specific question\n"
                 "Use all provided context to give the most accurate and helpful "
-                "answer possible."
+                "answer possible." + (f"\n\n{tools_guidance}" if tools_guidance else "")
             ),
         }
 
@@ -130,38 +298,114 @@ class ChatSession:
                 {"role": Role.SYSTEM.value, "content": long_term_content}
             )
 
-        # window_content is a JSON-encoded list of {role, content} dicts from
-        # the MCP tool.  Parse it back so we can extend context_messages.
         if window_content:
-            import json
-
             try:
                 window_turns = json.loads(window_content)
                 context_messages.extend(window_turns)
             except (json.JSONDecodeError, TypeError):
                 logger.warning("Could not parse window content from MCP tool.")
 
-        rag_used = bool(rag_content)
-        if rag_used:
-            context_messages.append({"role": Role.SYSTEM.value, "content": rag_content})
-
         context_messages.append({"role": Role.USER.value, "content": user_input})
+
+        # Run the tool-calling loop before streaming. Each iteration asks the
+        # model for a response; if it returns tool calls we execute them and
+        # append the results, then loop. We stop when the model produces a plain
+        # text response or we hit the loop cap.
+        #
+        # ``resolved_answer`` is set only when the model produces a plain-text
+        # response inside the loop. When it is set, _persisting_stream emits it
+        # directly without an extra Ollama call. When the loop cap is hit while
+        # the model keeps requesting tools, resolved_answer stays None and
+        # _persisting_stream falls through to a final streaming Ollama call so
+        # the model can produce a proper closing answer.
+        messages = context_messages
+        resolved_answer: str | None = None
+        if self.mcp_tools:
+            for _ in range(settings.server_tool_call_max_loops):
+                probe_response = self.client.chat(
+                    model=self.model,
+                    messages=messages,
+                    stream=False,
+                    options={"num_ctx": settings.server_ollama_num_ctx},
+                )
+                assistant_text = probe_response["message"]["content"]
+                tool_calls = parse_tool_calls(assistant_text)
+
+                if not tool_calls:
+                    if not assistant_text.strip().startswith("{"):
+                        resolved_answer = assistant_text
+                    break
+
+                logger.info(
+                    "Session %s: executing %d tool call(s): %s",
+                    self.session_id,
+                    len(tool_calls),
+                    [c.name for c in tool_calls],
+                )
+
+                tool_result_messages = await self._execute_tool_calls(tool_calls)
+                messages = (
+                    messages
+                    + [{"role": Role.ASSISTANT.value, "content": assistant_text}]
+                    + tool_result_messages
+                )
 
         mcp_session = self.mcp_session
         session_id_str_ = session_id_str
 
         async def _persisting_stream() -> AsyncGenerator[str, None]:
             assembled = ""
-            stream = self.client.chat(
-                model=self.model,
-                messages=context_messages,
-                stream=True,
-                options={"num_ctx": settings.server_ollama_num_ctx},
-            )
-            for chunk in stream:
-                token = chunk["message"]["content"]
-                assembled += token
-                yield token
+
+            # If the tool loop resolved to a plain-text answer, emit it directly
+            # without a redundant Ollama call.
+            if resolved_answer is not None:
+                for char in resolved_answer:
+                    assembled += char
+                    yield char
+            else:
+                stream = self.client.chat(
+                    model=self.model,
+                    messages=messages,
+                    stream=True,
+                    options={"num_ctx": settings.server_ollama_num_ctx},
+                )
+                buffered_tokens: list[str] = []
+                for chunk in stream:
+                    token = chunk["message"]["content"]
+                    buffered_tokens.append(token)
+
+                streamed_text = "".join(buffered_tokens)
+
+                if parse_tool_calls(streamed_text):
+                    # The model is still trying to call tools after the loop cap.
+                    # Force a plain-text answer by appending an explicit instruction.
+                    logger.warning(
+                        "Session %s: model still returning tool calls after loop cap; "
+                        "forcing plain-text answer.",
+                        session_id_str_,
+                    )
+                    forced_messages = messages + [
+                        {"role": Role.ASSISTANT.value, "content": streamed_text},
+                        {
+                            "role": Role.USER.value,
+                            "content": (
+                                "Please answer the original question. "
+                                "Do not call any more tools."
+                            ),
+                        },
+                    ]
+                    forced_response = self.client.chat(
+                        model=self.model,
+                        messages=forced_messages,
+                        stream=False,
+                        options={"num_ctx": settings.server_ollama_num_ctx},
+                    )
+                    assembled = forced_response["message"]["content"]
+                else:
+                    assembled = streamed_text
+
+                for char in assembled:
+                    yield char
 
             try:
                 await mcp_session.call_tool(
@@ -180,4 +424,4 @@ class ChatSession:
                     exc_info=True,
                 )
 
-        return _persisting_stream(), rag_used
+        return _persisting_stream()

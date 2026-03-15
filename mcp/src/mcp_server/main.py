@@ -19,7 +19,7 @@ setup_logging()
 mcp = FastMCP(name="localllm-mcp", lifespan=lifespan)
 
 
-@mcp.tool()
+@mcp.tool(tags={"internal"})
 def load_conversation_window(session_id: str, window_size: int = 10) -> list[dict]:
     """Return the most recent verbatim turns for a session, oldest first.
 
@@ -33,7 +33,7 @@ def load_conversation_window(session_id: str, window_size: int = 10) -> list[dic
     return load_window(get_pg_dsn(), uuid.UUID(session_id), window_size=window_size)
 
 
-@mcp.tool()
+@mcp.tool(tags={"internal"})
 def load_long_term_memory(session_id: str, long_term_max: int = 3) -> str:
     """Return Mem0-extracted semantic facts for a session as a formatted string.
 
@@ -52,7 +52,7 @@ def load_long_term_memory(session_id: str, long_term_max: int = 3) -> str:
     return messages[0]["content"]
 
 
-@mcp.tool()
+@mcp.tool(tags={"internal"})
 def persist_message(session_id: str, role: str, content: str) -> None:
     """Persist a single conversation turn to both Mem0 and the verbatim window.
 

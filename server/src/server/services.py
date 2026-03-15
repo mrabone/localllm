@@ -5,6 +5,7 @@ from typing import Annotated, AsyncGenerator
 from fastapi import Depends, FastAPI
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
+from mcp.types import Tool
 from ollama import Client
 
 from common.db import build_pg_dsn
@@ -18,12 +19,13 @@ logger = logging.getLogger(__name__)
 _ollama_client: Client | None = None
 _mcp_session: ClientSession | None = None
 _pg_dsn: str | None = None
+_mcp_tools: list[Tool] = []
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Connect to shared services on startup and disconnect on shutdown."""
-    global _ollama_client, _mcp_session, _pg_dsn
+    global _ollama_client, _mcp_session, _pg_dsn, _mcp_tools
 
     logger.info("Starting server, connecting to services...")
 
@@ -43,6 +45,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                 await session.initialize()
                 _mcp_session = session
                 logger.info("MCP client session established.")
+
+                tools_result = await session.list_tools()
+                _mcp_tools = tools_result.tools
+                logger.info(
+                    "Discovered %d MCP tools: %s",
+                    len(_mcp_tools),
+                    [t.name for t in _mcp_tools],
+                )
+
                 yield
     except Exception as exc:
         logger.error("Failed to connect to MCP server: %s", exc, exc_info=True)
@@ -71,6 +82,23 @@ def get_pg_dsn() -> str:
     return _pg_dsn
 
 
+def _is_internal_tool(tool: Tool) -> bool:
+    """Return True if the tool is tagged as internal infrastructure.
+
+    Internal tools are called directly by the server and should never be
+    described to the model.  FastMCP encodes tags in tool.meta under the
+    key ``fastmcp.tags``; any tool carrying the ``"internal"`` tag is
+    excluded from the model-facing tool list.
+    """
+    tags = (tool.meta or {}).get("fastmcp", {}).get("tags", [])
+    return "internal" in tags
+
+
+def get_mcp_tools() -> list[Tool]:
+    return [t for t in _mcp_tools if not _is_internal_tool(t)]
+
+
 OllamaClientDep = Annotated[Client, Depends(get_ollama_client)]
 McpSessionDep = Annotated[ClientSession, Depends(get_mcp_session)]
 PgDsnDep = Annotated[str, Depends(get_pg_dsn)]
+McpToolsDep = Annotated[list[Tool], Depends(get_mcp_tools)]

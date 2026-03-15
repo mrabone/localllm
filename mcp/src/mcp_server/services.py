@@ -50,7 +50,7 @@ async def lifespan(server: FastMCP):
         "llm": {
             "provider": "ollama",
             "config": {
-                "model": settings.rag_ollama_model,
+                "model": settings.mem0_llm_model,
                 "ollama_base_url": settings.ollama_base_url,
                 "temperature": 0.1,
             },

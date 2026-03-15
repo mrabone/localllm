@@ -1,4 +1,3 @@
-import json
 import logging
 import uuid
 from typing import AsyncGenerator
@@ -10,7 +9,13 @@ from sse_starlette.sse import EventSourceResponse
 from server.chat import ChatSession
 from server.config import settings
 from server.memory import create_session, session_exists
-from server.services import McpSessionDep, OllamaClientDep, PgDsnDep, lifespan
+from server.services import (
+    McpSessionDep,
+    McpToolsDep,
+    OllamaClientDep,
+    PgDsnDep,
+    lifespan,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +86,7 @@ async def chat(
     pg_dsn: PgDsnDep,
     mcp_session: McpSessionDep,
     ollama_client: OllamaClientDep,
+    mcp_tools: McpToolsDep,
 ) -> EventSourceResponse:
     """Send a message and stream the assistant response as SSE.
 
@@ -97,14 +103,12 @@ async def chat(
         session_id=session_id,
         mcp_session=mcp_session,
         ollama_client=ollama_client,
+        mcp_tools=mcp_tools,
     )
 
-    token_stream, rag_used = await session.chat(body.message)
+    token_stream = await session.chat(body.message)
 
     async def event_generator() -> AsyncGenerator[dict, None]:
-        if rag_used:
-            yield {"event": "rag", "data": json.dumps({"document_count": None})}
-
         try:
             async for token in token_stream:
                 yield {"event": "token", "data": token}

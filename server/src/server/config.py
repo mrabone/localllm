@@ -59,6 +59,14 @@ class Settings(SharedSettings):
             "messages at the top of the context on every turn."
         ),
     )
+    server_tool_call_max_loops: int = Field(
+        default=3,
+        alias="SERVER_TOOL_CALL_MAX_LOOPS",
+        description=(
+            "Maximum number of tool-calling rounds the LLM is allowed per turn "
+            "before being forced to produce a plain-text answer."
+        ),
+    )
 
 
 settings = Settings()
