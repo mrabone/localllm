@@ -1,8 +1,13 @@
 import uuid
 
+import httpx
 import uvicorn
 from fastmcp import FastMCP
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+from starlette.routing import Route
 
+from common.db_pool import is_pool_healthy
 from common.logging_utils import setup_logging
 from mcp_server.config import settings
 from mcp_server.memory import (
@@ -12,7 +17,13 @@ from mcp_server.memory import (
     save_message,
 )
 from mcp_server.rag import build_rag_system_message, get_rag_context
-from mcp_server.services import get_mem0, get_pg_dsn, get_rag_store, lifespan
+from mcp_server.services import (
+    ServiceContainer,
+    get_mem0,
+    get_pg_dsn,
+    get_rag_store,
+    lifespan,
+)
 
 setup_logging()
 
@@ -91,8 +102,52 @@ def search_knowledge_base(query: str) -> str:
 
 
 def main() -> None:
+    async def health_check(request: Request) -> JSONResponse:
+        """Health check endpoint for container orchestration.
+
+        Verifies that the service container is initialised and that both
+        PostgreSQL and Ollama are reachable.  Returns 200 when healthy,
+        503 when any dependency is unavailable.
+        """
+        if ServiceContainer.get_or_none() is None:
+            return JSONResponse(
+                {"status": "unavailable", "detail": "services not yet initialised"},
+                status_code=503,
+            )
+
+        checks: dict[str, str] = {}
+        healthy = True
+
+        try:
+            if is_pool_healthy():
+                checks["postgres"] = "ok"
+            else:
+                checks["postgres"] = "error: pool unavailable"
+                healthy = False
+        except Exception as exc:
+            checks["postgres"] = f"error: {exc}"
+            healthy = False
+
+        try:
+            async with httpx.AsyncClient(timeout=3) as client:
+                response = await client.get(f"{settings.ollama_base_url}/api/tags")
+                response.raise_for_status()
+            checks["ollama"] = "ok"
+        except Exception as exc:
+            checks["ollama"] = f"error: {exc}"
+            healthy = False
+
+        status_code = 200 if healthy else 503
+        return JSONResponse(
+            {"status": "ok" if healthy else "degraded", "checks": checks},
+            status_code=status_code,
+        )
+
+    app = mcp.http_app(path="/mcp")
+    app.routes.append(Route("/health", health_check, methods=["GET"]))
+
     uvicorn.run(
-        mcp.http_app(path="/mcp"),
+        app,
         host=settings.mcp_host,
         port=settings.mcp_port,
     )

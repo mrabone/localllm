@@ -21,6 +21,8 @@ FROM python:3.12-slim AS runtime
 
 WORKDIR /app
 
+RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
+
 COPY --from=builder /opt/venv /opt/venv
 
 ENV PYTHONPATH=/opt/venv \
@@ -34,7 +36,7 @@ FROM python:3.12-slim AS dev
 
 WORKDIR /app
 
-RUN pip install uv
+RUN pip install uv && apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
 
 COPY pyproject.toml uv.lock* ./
 COPY common/ common/

@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from enum import Enum
 from typing import AsyncGenerator
@@ -173,12 +174,14 @@ class ChatSession:
         session_id: uuid.UUID,
         mcp_session: ClientSession,
         ollama_client: Client,
+        thread_pool: ThreadPoolExecutor,
         model: str | None = None,
         mcp_tools: list[Tool] | None = None,
     ) -> None:
         self.session_id = session_id
         self.mcp_session = mcp_session
         self.client = ollama_client
+        self.thread_pool = thread_pool
         self.model = model if model is not None else settings.server_ollama_model
         self.mcp_tools = mcp_tools or []
 
@@ -274,9 +277,29 @@ class ChatSession:
             )
         )
 
-        long_term_content, window_content, _ = await asyncio.gather(
-            long_term_task, window_task, persist_user_task
+        gather_results = await asyncio.gather(
+            long_term_task, window_task, persist_user_task, return_exceptions=True
         )
+
+        tool_names = [
+            TOOL_LOAD_LONG_TERM_MEMORY,
+            TOOL_LOAD_CONVERSATION_WINDOW,
+            TOOL_PERSIST_MESSAGE,
+        ]
+        resolved: list[str] = []
+        for name, result in zip(tool_names, gather_results):
+            if isinstance(result, BaseException):
+                logger.warning(
+                    "MCP tool '%s' failed during context gather (session=%s): %s",
+                    name,
+                    session_id_str,
+                    result,
+                )
+                resolved.append("")
+            else:
+                resolved.append(result)
+
+        long_term_content, window_content, _ = resolved
 
         tools_guidance = build_tools_system_message(self.mcp_tools)
 
@@ -311,26 +334,19 @@ class ChatSession:
 
         context_messages.append({"role": Role.USER.value, "content": user_input})
 
-        # Run the tool-calling loop before streaming. Each iteration asks the
-        # model for a response; if it returns tool calls we execute them and
-        # append the results, then loop. We stop when the model produces a plain
-        # text response or we hit the loop cap.
-        #
-        # ``resolved_answer`` is set only when the model produces a plain-text
-        # response inside the loop. When it is set, _persisting_stream emits it
-        # directly without an extra Ollama call. When the loop cap is hit while
-        # the model keeps requesting tools, resolved_answer stays None and
-        # _persisting_stream falls through to a final streaming Ollama call so
-        # the model can produce a proper closing answer.
         messages = context_messages
         resolved_answer: str | None = None
+        loop = asyncio.get_running_loop()
         if self.mcp_tools:
             for _ in range(settings.server_tool_call_max_loops):
-                probe_response = self.client.chat(
-                    model=self.model,
-                    messages=messages,
-                    stream=False,
-                    options={"num_ctx": settings.server_ollama_num_ctx},
+                probe_response = await loop.run_in_executor(
+                    self.thread_pool,
+                    lambda msgs=messages: self.client.chat(
+                        model=self.model,
+                        messages=msgs,
+                        stream=False,
+                        options={"num_ctx": settings.server_ollama_num_ctx},
+                    ),
                 )
                 assistant_text = probe_response["message"]["content"]
                 tool_calls = parse_tool_calls(assistant_text)
@@ -355,41 +371,35 @@ class ChatSession:
                 )
 
         mcp_session = self.mcp_session
-        session_id_str_ = session_id_str
 
-        async def _persisting_stream() -> AsyncGenerator[str, None]:
-            assembled = ""
+        async def _collect_stream(ollama_messages: list[dict]) -> list[str]:
+            loop = asyncio.get_running_loop()
 
-            # If the tool loop resolved to a plain-text answer, emit it directly
-            # without a redundant Ollama call.
-            if resolved_answer is not None:
-                for char in resolved_answer:
-                    assembled += char
-                    yield char
-            else:
-                # Loop cap hit: buffer all tokens before yielding so we can
-                # detect tool-call JSON and intercept it before it reaches the
-                # caller. Streaming fidelity matters less on this rare error path.
+            def _run() -> list[str]:
                 stream = self.client.chat(
                     model=self.model,
-                    messages=messages,
+                    messages=ollama_messages,
                     stream=True,
                     options={"num_ctx": settings.server_ollama_num_ctx},
                 )
-                streamed_tokens: list[str] = []
-                for chunk in stream:
-                    token = chunk["message"]["content"]
-                    streamed_tokens.append(token)
+                return [chunk["message"]["content"] for chunk in stream]
 
-                streamed_text = "".join(streamed_tokens)
+            return await loop.run_in_executor(self.thread_pool, _run)
+
+        async def _persisting_stream() -> AsyncGenerator[str, None]:
+            assembled = ""
+            if resolved_answer is not None:
+                assembled = resolved_answer
+                yield resolved_answer
+            else:
+                tokens = await _collect_stream(messages)
+                streamed_text = "".join(tokens)
 
                 if parse_tool_calls(streamed_text):
-                    # The model is still trying to call tools after the loop cap.
-                    # Force a plain-text answer by appending an explicit instruction.
                     logger.warning(
                         "Session %s: model still returning tool calls after loop cap; "
                         "forcing plain-text answer.",
-                        session_id_str_,
+                        session_id_str,
                     )
                     forced_messages = messages + [
                         {"role": Role.ASSISTANT.value, "content": streamed_text},
@@ -401,30 +411,27 @@ class ChatSession:
                             ),
                         },
                     ]
-                    forced_response = self.client.chat(
-                        model=self.model,
-                        messages=forced_messages,
-                        stream=False,
-                        options={"num_ctx": settings.server_ollama_num_ctx},
+                    forced_response = await loop.run_in_executor(
+                        self.thread_pool,
+                        lambda msgs=forced_messages: self.client.chat(
+                            model=self.model,
+                            messages=msgs,
+                            stream=False,
+                            options={"num_ctx": settings.server_ollama_num_ctx},
+                        ),
                     )
                     assembled = forced_response["message"]["content"]
+                    yield assembled
                 else:
                     assembled = streamed_text
-                    for token in streamed_tokens:
+                    for token in tokens:
                         yield token
-                    # assembled is set; fall through to persist without double-yielding
-                    # by returning after the persist call at the end of the function.
-                    # We use a flag to avoid re-yielding assembled below.
-
-                if assembled != streamed_text or parse_tool_calls(streamed_text):
-                    for char in assembled:
-                        yield char
 
             try:
                 await mcp_session.call_tool(
                     TOOL_PERSIST_MESSAGE,
                     arguments={
-                        "session_id": session_id_str_,
+                        "session_id": session_id_str,
                         "role": Role.ASSISTANT.value,
                         "content": assembled,
                     },
@@ -432,7 +439,7 @@ class ChatSession:
             except Exception as exc:
                 logger.error(
                     "Failed to persist assistant message (session=%s): %s",
-                    session_id_str_,
+                    session_id_str,
                     exc,
                     exc_info=True,
                 )

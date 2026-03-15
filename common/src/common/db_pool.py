@@ -118,6 +118,21 @@ class _PooledConn:
         return False
 
 
+def is_pool_healthy() -> bool:
+    """Return True if the pool is initialised and has at least one open connection.
+
+    Inspects the pool's idle connection list without checking out a connection
+    or executing any query, making it suitable for frequent health checks.
+    """
+    pool_state = _ConnectionPool._instance
+    if pool_state is None:
+        return False
+    try:
+        return any(conn.closed == 0 for conn in pool_state.pool._pool)
+    except Exception:
+        return False
+
+
 def get_conn(dsn: str) -> "_PooledConn":
     """Return a ``_PooledConn`` context manager for *dsn*.
 

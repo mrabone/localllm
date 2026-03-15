@@ -2,10 +2,13 @@ import logging
 import uuid
 from typing import AsyncGenerator
 
+import httpx
+import uvicorn
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
+from common.db_pool import is_pool_healthy
 from server.chat import ChatSession
 from server.config import settings
 from server.memory import create_session, session_exists
@@ -14,6 +17,8 @@ from server.services import (
     McpToolsDep,
     OllamaClientDep,
     PgDsnDep,
+    ServiceContainer,
+    ThreadPoolDep,
     lifespan,
 )
 
@@ -87,44 +92,102 @@ async def chat(
     mcp_session: McpSessionDep,
     ollama_client: OllamaClientDep,
     mcp_tools: McpToolsDep,
+    thread_pool: ThreadPoolDep,
 ) -> EventSourceResponse:
     """Send a message and stream the assistant response as SSE.
 
-    Events:
+    Always returns an EventSourceResponse so the client always receives
+    text/event-stream, even on error. Events:
       - ``token``  — one text fragment from the model.
-      - ``rag``    — emitted before tokens when RAG context was used.
       - ``done``   — signals the end of the stream (data: "[DONE]").
-      - ``error``  — sent if an exception occurs mid-stream.
+      - ``error``  — sent if an exception occurs at any point.
     """
-    if not session_exists(pg_dsn, session_id):
-        raise HTTPException(status_code=404, detail="Session not found.")
-
-    session = ChatSession(
-        session_id=session_id,
-        mcp_session=mcp_session,
-        ollama_client=ollama_client,
-        mcp_tools=mcp_tools,
-    )
-
-    token_stream = await session.chat(body.message)
 
     async def event_generator() -> AsyncGenerator[dict, None]:
         try:
+            if not session_exists(pg_dsn, session_id):
+                yield {"event": "error", "data": "Session not found."}
+                return
+
+            session = ChatSession(
+                session_id=session_id,
+                mcp_session=mcp_session,
+                ollama_client=ollama_client,
+                thread_pool=thread_pool,
+                mcp_tools=mcp_tools,
+            )
+
+            token_stream = await session.chat(body.message)
+
             async for token in token_stream:
                 yield {"event": "token", "data": token}
-        except Exception as exc:
-            logger.error("Error during streaming for session %s: %s", session_id, exc)
-            yield {"event": "error", "data": str(exc)}
-            return
 
-        yield {"event": "done", "data": "[DONE]"}
+            yield {"event": "done", "data": "[DONE]"}
+        except Exception as exc:
+            logger.exception("Error during chat for session %s - %s", session_id, exc)
+            yield {
+                "event": "error",
+                "data": str(exc) or "An unknown server error occurred.",
+            }
 
     return EventSourceResponse(event_generator())
 
 
-def main() -> None:
-    import uvicorn
+@app.get("/health")
+async def health_check() -> dict:
+    """Health check endpoint for container orchestration.
 
+    Verifies that the service container is initialised and that PostgreSQL,
+    Ollama, and the MCP server are all reachable.  Returns 200 when healthy,
+    503 when any dependency is unavailable.
+    """
+    if ServiceContainer.get_or_none() is None:
+        raise HTTPException(
+            status_code=503,
+            detail={"status": "unavailable", "detail": "services not yet initialised"},
+        )
+
+    checks: dict[str, str] = {}
+    healthy = True
+
+    try:
+        if is_pool_healthy():
+            checks["postgres"] = "ok"
+        else:
+            checks["postgres"] = "error: pool unavailable"
+            healthy = False
+    except Exception as exc:
+        checks["postgres"] = f"error: {exc}"
+        healthy = False
+
+    try:
+        async with httpx.AsyncClient(timeout=3) as client:
+            response = await client.get(f"{settings.ollama_base_url}/api/tags")
+            response.raise_for_status()
+        checks["ollama"] = "ok"
+    except Exception as exc:
+        checks["ollama"] = f"error: {exc}"
+        healthy = False
+
+    try:
+        async with httpx.AsyncClient(timeout=3) as client:
+            response = await client.get(f"{settings.mcp_server_url}/health")
+            response.raise_for_status()
+        checks["mcp"] = "ok"
+    except Exception as exc:
+        checks["mcp"] = f"error: {exc}"
+        healthy = False
+
+    if not healthy:
+        raise HTTPException(
+            status_code=503,
+            detail={"status": "degraded", "checks": checks},
+        )
+
+    return {"status": "ok", "checks": checks}
+
+
+def main() -> None:
     uvicorn.run(
         "server.main:app",
         host=settings.server_host,

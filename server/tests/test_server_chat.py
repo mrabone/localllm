@@ -1,5 +1,6 @@
 import json
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -32,6 +33,7 @@ def _make_session(**kwargs) -> ChatSession:
         session_id=kwargs.pop("session_id", uuid.uuid4()),
         mcp_session=kwargs.pop("mcp_session", mcp_session),
         ollama_client=kwargs.pop("ollama_client", ollama_client),
+        thread_pool=kwargs.pop("thread_pool", ThreadPoolExecutor()),
         **kwargs,
     )
 

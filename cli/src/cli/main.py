@@ -40,18 +40,8 @@ class ChatApplication:
             "POST",
             url,
             json={"message": user_input},
-            timeout=httpx.Timeout(connect=10.0, read=300.0),
+            timeout=httpx.Timeout(connect=10.0, read=300.0, write=10.0, pool=10.0),
         ) as event_source:
-            if event_source.response.status_code != 200:
-                # Truncate the body to avoid leaking server-side stack traces
-                # or configuration details to the terminal.
-                # .read() must be called explicitly because the response is
-                # opened as a stream and .text is not available until buffered.
-                event_source.response.read()
-                raw = event_source.response.text[:200]
-                print(f"Server error {event_source.response.status_code}: {raw}")
-                return
-
             for sse in event_source.iter_sse():
                 if sse.event == "token":
                     print(sse.data, end="", flush=True)
