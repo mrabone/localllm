@@ -21,7 +21,6 @@ Sessions are stored in a JSON registry at `~/.localllm_sessions.json` (configura
 
 - **Session entries** — keys are human-readable session names (e.g. `"work"`, `"project-x"`), values are UUID strings. These sessions persist across CLI runs.
 - **`_cache` key** — Reserved key (never used as a session name). Stores per-session validation timestamps to implement the TTL cache and avoid redundant server calls.
- - **`_cache` key** — Reserved key (never used as a session name). Stores per-session validation timestamps to implement the TTL cache and avoid redundant server calls.
 
 Note: The UUID strings stored in this registry are directly used as Mem0 user IDs by the server; they identify which semantic memories belong to which CLI session.
 
