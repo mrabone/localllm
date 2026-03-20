@@ -28,6 +28,10 @@ class Settings(SharedSettings):
         default="custom-chatbot-model",
         alias="SERVER_OLLAMA_MODEL",
     )
+    server_function_calling_model: str = Field(
+        default="functiongemma",
+        alias="SERVER_FUNCTION_CALLING_MODEL",
+    )
     server_ollama_num_ctx: int = Field(
         default=8192,
         alias="SERVER_OLLAMA_NUM_CTX",

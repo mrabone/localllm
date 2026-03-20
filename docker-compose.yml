@@ -47,6 +47,11 @@ services:
         ollama pull embeddinggemma
         echo ""
         echo "================================"
+        echo "Pulling function calling model..."
+        echo "================================"
+        ollama pull functiongemma
+        echo ""
+        echo "================================"
         echo "✓ Models ready! You can now run your application"
         echo "================================"
         wait $$SERVER_PID
@@ -98,7 +103,7 @@ services:
       db:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      test: [ "CMD", "curl", "-f", "http://localhost:8001/health" ]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -135,7 +140,7 @@ services:
       mcp:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      test: [ "CMD", "curl", "-f", "http://localhost:8000/health" ]
       interval: 10s
       timeout: 5s
       retries: 5

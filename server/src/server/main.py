@@ -1,8 +1,8 @@
+import asyncio
 import logging
 import uuid
 from typing import AsyncGenerator
 
-import anyio
 import httpx
 import uvicorn
 from fastapi import FastAPI, HTTPException
@@ -10,16 +10,17 @@ from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
 from common.db_pool import is_pool_healthy
-from server.chat import ChatSession
+from mcp.types import TextContent
+from server.chat import TOOL_LOAD_LONG_TERM_MEMORY, run_chat_graph
 from server.config import settings
 from server.memory import create_session, session_exists
 from server.services import (
+    FunctionCallingModelDep,
     McpSessionDep,
     McpToolsDep,
     OllamaClientDep,
     PgDsnDep,
     ServiceContainer,
-    ThreadPoolDep,
     lifespan,
 )
 
@@ -70,14 +71,15 @@ async def get_session_history(
     session_id: uuid.UUID, pg_dsn: PgDsnDep, mcp_session: McpSessionDep
 ) -> SessionHistoryResponse:
     """Return the stored memories for an existing session."""
-    exists = await anyio.to_thread.run_sync(lambda: session_exists(pg_dsn, session_id))
+    exists = await asyncio.to_thread(session_exists, pg_dsn, session_id)
     if not exists:
         raise HTTPException(status_code=404, detail="Session not found.")
 
     memories_result = await mcp_session.call_tool(
-        "load_long_term_memory", arguments={"session_id": str(session_id)}
+        TOOL_LOAD_LONG_TERM_MEMORY, arguments={"session_id": str(session_id)}
     )
-    memories_text = memories_result.content[0].text if memories_result.content else ""
+    first_memory = memories_result.content[0] if memories_result.content else None
+    memories_text = first_memory.text if isinstance(first_memory, TextContent) else ""
     messages = (
         [MessageResponse(role="system", content=memories_text)] if memories_text else []
     )
@@ -92,35 +94,33 @@ async def chat(
     mcp_session: McpSessionDep,
     ollama_client: OllamaClientDep,
     mcp_tools: McpToolsDep,
-    thread_pool: ThreadPoolDep,
+    function_calling_model: FunctionCallingModelDep,
 ) -> EventSourceResponse:
     """Send a message and stream the assistant response as SSE.
 
-    Always returns an EventSourceResponse so the client always receives
-    text/event-stream, even on error. Events:
+    The session existence check happens before the EventSourceResponse is
+    created so that a missing session returns a proper HTTP 404 rather than
+    an SSE error event.
+
+    Events:
       - ``token``  — one text fragment from the model.
       - ``done``   — signals the end of the stream (data: "[DONE]").
       - ``error``  — sent if an exception occurs at any point.
     """
+    if not await asyncio.to_thread(session_exists, pg_dsn, session_id):
+        raise HTTPException(status_code=404, detail="Session not found.")
 
     async def event_generator() -> AsyncGenerator[dict, None]:
         try:
-            session_found = await anyio.to_thread.run_sync(
-                lambda: session_exists(pg_dsn, session_id)
-            )
-            if not session_found:
-                yield {"event": "error", "data": "Session not found."}
-                return
-
-            session = ChatSession(
+            token_stream = await run_chat_graph(
                 session_id=session_id,
+                user_input=body.message,
                 mcp_session=mcp_session,
                 ollama_client=ollama_client,
-                thread_pool=thread_pool,
+                chat_model=settings.server_ollama_model,
+                function_calling_model=function_calling_model,
                 mcp_tools=mcp_tools,
             )
-
-            token_stream = await session.chat(body.message)
 
             async for token in token_stream:
                 yield {"event": "token", "data": token}
@@ -141,8 +141,9 @@ async def health_check() -> dict:
     """Health check endpoint for container orchestration.
 
     Verifies that the service container is initialised and that PostgreSQL,
-    Ollama, and the MCP server are all reachable.  Returns 200 when healthy,
-    503 when any dependency is unavailable.
+    Ollama, and the MCP server are all reachable.  The three dependency checks
+    run in parallel to minimise latency.  Returns 200 when healthy, 503 when
+    any dependency is unavailable.
     """
     if ServiceContainer.get_or_none() is None:
         raise HTTPException(
@@ -150,36 +151,42 @@ async def health_check() -> dict:
             detail={"status": "unavailable", "detail": "services not yet initialised"},
         )
 
-    checks: dict[str, str] = {}
-    healthy = True
+    async def _check_postgres() -> str:
+        try:
+            if is_pool_healthy():
+                return "ok"
+            return "error: pool unavailable"
+        except Exception as exc:
+            return f"error: {exc}"
 
-    try:
-        if is_pool_healthy():
-            checks["postgres"] = "ok"
-        else:
-            checks["postgres"] = "error: pool unavailable"
-            healthy = False
-    except Exception as exc:
-        checks["postgres"] = f"error: {exc}"
-        healthy = False
+    async def _check_ollama() -> str:
+        try:
+            async with httpx.AsyncClient(timeout=3) as client:
+                response = await client.get(f"{settings.ollama_base_url}/api/tags")
+                response.raise_for_status()
+            return "ok"
+        except Exception as exc:
+            return f"error: {exc}"
 
-    try:
-        async with httpx.AsyncClient(timeout=3) as client:
-            response = await client.get(f"{settings.ollama_base_url}/api/tags")
-            response.raise_for_status()
-        checks["ollama"] = "ok"
-    except Exception as exc:
-        checks["ollama"] = f"error: {exc}"
-        healthy = False
+    async def _check_mcp() -> str:
+        try:
+            async with httpx.AsyncClient(timeout=3) as client:
+                response = await client.get(f"{settings.mcp_server_url}/health")
+                response.raise_for_status()
+            return "ok"
+        except Exception as exc:
+            return f"error: {exc}"
 
-    try:
-        async with httpx.AsyncClient(timeout=3) as client:
-            response = await client.get(f"{settings.mcp_server_url}/health")
-            response.raise_for_status()
-        checks["mcp"] = "ok"
-    except Exception as exc:
-        checks["mcp"] = f"error: {exc}"
-        healthy = False
+    postgres_result, ollama_result, mcp_result = await asyncio.gather(
+        _check_postgres(), _check_ollama(), _check_mcp()
+    )
+
+    checks = {
+        "postgres": postgres_result,
+        "ollama": ollama_result,
+        "mcp": mcp_result,
+    }
+    healthy = all(v == "ok" for v in checks.values())
 
     if not healthy:
         raise HTTPException(
