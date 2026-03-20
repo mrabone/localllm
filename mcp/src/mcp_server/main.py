@@ -30,6 +30,10 @@ setup_logging()
 mcp = FastMCP(name="localllm-mcp", lifespan=lifespan)
 
 
+# These three tools are tagged "internal" so the server-side filter in
+# services._is_internal_tool() excludes them from the tool list passed to
+# FunctionGemma.  The chat graph calls them directly by name on every turn —
+# they are infrastructure, not model-callable capabilities.
 @mcp.tool(tags={"internal"})
 def load_conversation_window(session_id: str, window_size: int = 10) -> list[dict]:
     """Return the most recent verbatim turns for a session, oldest first.

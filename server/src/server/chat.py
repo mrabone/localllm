@@ -2,14 +2,16 @@ import asyncio
 import json
 import logging
 import uuid
-from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
 from enum import Enum
-from typing import AsyncGenerator
+from dataclasses import dataclass
+from typing import AsyncGenerator, Literal
 
+from langgraph.graph import END, StateGraph
+from langgraph.graph.state import CompiledStateGraph
 from mcp import ClientSession
-from mcp.types import Tool
-from ollama import Client
+from mcp.types import TextContent, Tool
+from ollama import AsyncClient
+from typing_extensions import TypedDict
 
 from server.config import settings
 
@@ -34,111 +36,6 @@ class ToolCall:
     arguments: dict
 
 
-def build_tools_system_message(tools: list[Tool]) -> str:
-    """Build the system message that instructs the LLM how to call tools.
-
-    Renders each tool's name, description, and input schema into a plain-text
-    block the model can follow.  Returns an empty string when no tools are
-    available so the caller can skip appending it.
-    """
-    if not tools:
-        return ""
-
-    tool_descriptions = []
-    for tool in tools:
-        schema = tool.inputSchema or {}
-        properties = schema.get("properties", {})
-        required = schema.get("required", [])
-
-        params = []
-        for param_name, param_schema in properties.items():
-            param_type = param_schema.get("type", "any")
-            is_required = param_name in required
-            default = param_schema.get("default")
-            description = param_schema.get("description", "")
-
-            param_str = f"  - {param_name} ({param_type}"
-            if not is_required and default is not None:
-                param_str += f", default={default!r}"
-            param_str += ")"
-            if description:
-                param_str += f": {description}"
-            params.append(param_str)
-
-        params_block = "\n".join(params) if params else "  (no parameters)"
-        tool_descriptions.append(
-            f"### {tool.name}\n"
-            f"{tool.description or 'No description provided.'}\n"
-            f"Parameters:\n{params_block}"
-        )
-
-    tools_block = "\n\n".join(tool_descriptions)
-
-    return (
-        "## Available Tools\n\n"
-        "You may call any of the following tools when you need to retrieve "
-        "information or perform an action.  To call a tool, respond with a JSON "
-        "object — and nothing else — in exactly this format:\n\n"
-        '{"toolCalls": [{"id": "call_1", "name": "<tool_name>", "arguments": {"param": "value"}}]}\n\n'
-        "Replace <tool_name> with the tool you want to call and fill the "
-        '"arguments" object with the parameter names and values for that tool.\n\n'
-        "You may include multiple tool calls in a single response.  After receiving "
-        "tool results you will be prompted again to continue your answer.\n\n"
-        "Only output the JSON when you want to call a tool.  Do not wrap it in "
-        "markdown code fences or any other formatting — raw JSON only.  "
-        "When you have enough information to answer the user, respond normally in plain text.\n\n"
-        f"{tools_block}"
-    )
-
-
-def parse_tool_calls(response_text: str) -> list[ToolCall]:
-    """Extract tool calls from an LLM response string.
-
-    The model is instructed to respond with a bare JSON object when it wants
-    to call tools.  This function attempts to parse that object and returns a
-    (possibly empty) list of ToolCall instances.
-
-    Both camelCase (``toolCalls``, ``name``, ``arguments``) and snake_case
-    (``tool_calls``, ``tool_name``, ``tool_arguments``) key variants are
-    accepted so that the parser is tolerant of models that do not strictly
-    follow the casing in the system prompt.
-
-    Malformed or non-tool-call responses return an empty list so the caller
-    can treat them as plain assistant messages.
-    """
-    stripped = response_text.strip()
-
-    if stripped.startswith("```"):
-        lines = stripped.splitlines()
-        inner_lines = [line for line in lines[1:] if line.strip() != "```"]
-        stripped = "\n".join(inner_lines).strip()
-
-    if not stripped.startswith("{"):
-        return []
-
-    try:
-        payload = json.loads(stripped)
-    except json.JSONDecodeError:
-        return []
-
-    raw_calls = payload.get("toolCalls") or payload.get("tool_calls")
-    if not isinstance(raw_calls, list):
-        return []
-
-    tool_calls = []
-    for item in raw_calls:
-        if not isinstance(item, dict):
-            continue
-        call_id = item.get("id") or str(uuid.uuid4())
-        name = item.get("name") or item.get("tool_name")
-        arguments = item.get("arguments") or item.get("tool_arguments") or {}
-        if not name or not isinstance(arguments, dict):
-            continue
-        tool_calls.append(ToolCall(id=call_id, name=name, arguments=arguments))
-
-    return tool_calls
-
-
 def build_tool_result_message(call_id: str, name: str, content: str) -> dict:
     """Build a tool result message dictionary to be appended to the conversation."""
     return {
@@ -147,332 +44,392 @@ def build_tool_result_message(call_id: str, name: str, content: str) -> dict:
     }
 
 
-class ChatSession:
-    """Handles a single chat turn for a persistent session.
+def mcp_tools_to_ollama_schemas(tools: list[Tool]) -> list[dict]:
+    """Convert MCP Tool objects to the Ollama JSON Schema tool format.
 
-    Context is assembled in two layers on every turn:
-
-    1. **Long-term memories** — semantic facts extracted by Mem0 from previous
-       conversations, retrieved via the MCP ``load_long_term_memory`` tool and
-       injected as a ``system`` message.
-
-    2. **Sliding window** — the last ``window_size`` verbatim user/assistant
-       turns, retrieved via the MCP ``load_conversation_window`` tool.
-
-    Both retrieval calls are issued concurrently with the user-turn persistence
-    call using ``asyncio.gather`` to minimise first-token latency.
-
-    When MCP tools are provided via ``mcp_tools``, the LLM is given a system
-    message describing every available tool and instructed to respond with a
-    JSON ``toolCalls`` object when it wants to invoke one.  The chat method
-    will execute those calls (up to ``server_tool_call_max_loops`` rounds) and
-    feed results back before streaming the final answer.  The model may invoke
-    ``search_knowledge_base`` itself during this loop when it decides retrieval
-    is needed.
+    The returned list is passed directly to the Ollama `tools=` parameter when
+    calling FunctionGemma.  Ollama handles the FunctionGemma-specific prompt
+    formatting internally.
     """
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": tool.name,
+                "description": tool.description or "",
+                "parameters": tool.inputSchema or {"type": "object", "properties": {}},
+            },
+        }
+        for tool in tools
+    ]
 
-    def __init__(
-        self,
-        session_id: uuid.UUID,
-        mcp_session: ClientSession,
-        ollama_client: Client,
-        thread_pool: ThreadPoolExecutor,
-        model: str | None = None,
-        mcp_tools: list[Tool] | None = None,
-    ) -> None:
-        self.session_id = session_id
-        self.mcp_session = mcp_session
-        self.client = ollama_client
-        self.thread_pool = thread_pool
-        self.model = model if model is not None else settings.server_ollama_model
-        self.mcp_tools = mcp_tools or []
 
-    async def _call_tool(self, name: str, arguments: dict) -> str:
-        """Call a named MCP tool and return its first text content."""
-        result = await self.mcp_session.call_tool(name, arguments=arguments)
+class GraphState(TypedDict):
+    session_id: str
+    user_input: str
+    mcp_session: ClientSession
+    ollama_client: AsyncClient
+    chat_model: str
+    function_calling_model: str
+    mcp_tools: list[Tool]
+    messages: list[dict]
+    tool_results: list[dict]
+    loop_count: int
+    resolved_answer: str | None
+
+
+async def load_context_node(state: GraphState) -> dict:
+    """Load memory, conversation window, and persist the user turn concurrently.
+
+    Issues three MCP calls in parallel to minimise pre-stream latency.  Failures
+    are logged and treated as empty results so the turn can continue.
+    """
+    mcp_session = state["mcp_session"]
+    session_id = state["session_id"]
+    user_input = state["user_input"]
+
+    async def _call_tool(name: str, arguments: dict) -> str:
+        result = await mcp_session.call_tool(name, arguments=arguments)
         if result.content:
-            return result.content[0].text
+            first = result.content[0]
+            return first.text if isinstance(first, TextContent) else ""
         return ""
 
-    async def _execute_tool_calls(self, tool_calls: list[ToolCall]) -> list[dict]:
-        """Execute a list of tool calls concurrently and return result messages.
-
-        Each call is wrapped in its own try/except so a single failure does not
-        cancel the others.  Failures are returned as error strings so the LLM
-        can decide how to proceed.
-        """
-        known_names = {t.name for t in self.mcp_tools}
-
-        async def _run_one(call: ToolCall) -> dict:
-            if call.name not in known_names:
-                available = ", ".join(sorted(known_names)) or "none"
-                error = (
-                    f"ERROR: Unknown tool '{call.name}'. "
-                    f"Available tools are: {available}"
-                )
-                return build_tool_result_message(call.id, call.name, error)
-
-            try:
-                result = await self._call_tool(call.name, call.arguments)
-                if not result:
-                    result = "No results found. Answer the user's question using your own knowledge."
-                return build_tool_result_message(call.id, call.name, result)
-            except Exception as exc:
-                logger.warning(
-                    "Tool call '%s' failed (session=%s, arguments=%s): %s",
-                    call.name,
-                    self.session_id,
-                    call.arguments,
-                    exc,
-                )
-                error = (
-                    f"ERROR: Tool '{call.name}' failed with: {exc}. "
-                    "Continue with the information you have."
-                )
-                return build_tool_result_message(call.id, call.name, error)
-
-        return list(await asyncio.gather(*(_run_one(c) for c in tool_calls)))
-
-    async def chat(self, user_input: str) -> AsyncGenerator[str, None]:
-        """Process one user turn and return a token stream.
-
-        Fires three MCP tool calls concurrently to minimise pre-stream latency:
-        ``load_long_term_memory``, ``load_conversation_window``, and the
-        user-turn ``persist_message``.
-
-        If the session was created with ``mcp_tools``, up to
-        ``server_tool_call_max_loops`` rounds of tool calling are performed
-        before the final response is streamed back to the caller.  The model
-        may invoke ``search_knowledge_base`` itself via the tool-calling loop
-        when it decides retrieval is needed.
-
-        Returns an async generator that yields token strings.
-        """
-        session_id_str = str(self.session_id)
-
-        long_term_task = asyncio.create_task(
-            self._call_tool(
-                TOOL_LOAD_LONG_TERM_MEMORY,
-                {
-                    "session_id": session_id_str,
-                    "long_term_max": settings.server_memory_long_term_max,
-                },
-            )
-        )
-        window_task = asyncio.create_task(
-            self._call_tool(
-                TOOL_LOAD_CONVERSATION_WINDOW,
-                {
-                    "session_id": session_id_str,
-                    "window_size": settings.server_memory_window_size,
-                },
-            )
-        )
-        persist_user_task = asyncio.create_task(
-            self._call_tool(
-                TOOL_PERSIST_MESSAGE,
-                {
-                    "session_id": session_id_str,
-                    "role": Role.USER.value,
-                    "content": user_input,
-                },
-            )
-        )
-
-        gather_results = await asyncio.gather(
-            long_term_task, window_task, persist_user_task, return_exceptions=True
-        )
-
-        tool_names = [
+    gather_results = await asyncio.gather(
+        _call_tool(
             TOOL_LOAD_LONG_TERM_MEMORY,
+            {
+                "session_id": session_id,
+                "long_term_max": settings.server_memory_long_term_max,
+            },
+        ),
+        _call_tool(
             TOOL_LOAD_CONVERSATION_WINDOW,
+            {
+                "session_id": session_id,
+                "window_size": settings.server_memory_window_size,
+            },
+        ),
+        _call_tool(
             TOOL_PERSIST_MESSAGE,
-        ]
-        resolved: list[str] = []
-        for name, result in zip(tool_names, gather_results):
-            if isinstance(result, BaseException):
-                logger.warning(
-                    "MCP tool '%s' failed during context gather (session=%s): %s",
-                    name,
-                    session_id_str,
-                    result,
-                )
-                resolved.append("")
-            else:
-                resolved.append(result)
+            {
+                "session_id": session_id,
+                "role": Role.USER.value,
+                "content": user_input,
+            },
+        ),
+        return_exceptions=True,
+    )
 
-        long_term_content, window_content, _ = resolved
-
-        tools_guidance = build_tools_system_message(self.mcp_tools)
-
-        orientation = {
-            "role": Role.SYSTEM.value,
-            "content": (
-                "You are a helpful assistant. "
-                "On each turn you may be provided with additional context:\n"
-                "- Long-term memories: facts extracted from previous conversations "
-                "with this user\n"
-                "- Recent conversation history: the last few turns verbatim\n"
-                "- Knowledge base documents: relevant documents retrieved for this "
-                "specific question\n"
-                "Use all provided context to give the most accurate and helpful "
-                "answer possible." + (f"\n\n{tools_guidance}" if tools_guidance else "")
-            ),
-        }
-
-        context_messages: list[dict] = [orientation]
-
-        if long_term_content:
-            context_messages.append(
-                {"role": Role.SYSTEM.value, "content": long_term_content}
+    tool_names = [
+        TOOL_LOAD_LONG_TERM_MEMORY,
+        TOOL_LOAD_CONVERSATION_WINDOW,
+        TOOL_PERSIST_MESSAGE,
+    ]
+    resolved: list[str] = []
+    for name, result in zip(tool_names, gather_results):
+        if isinstance(result, BaseException):
+            logger.warning(
+                "MCP tool '%s' failed during context gather (session=%s): %s",
+                name,
+                session_id,
+                result,
             )
+            resolved.append("")
+        else:
+            resolved.append(result)  # type: ignore[arg-type]
 
-        if window_content:
-            try:
-                window_turns = json.loads(window_content)
-                context_messages.extend(window_turns)
-            except (json.JSONDecodeError, TypeError):
-                logger.warning("Could not parse window content from MCP tool.")
+    long_term_content, window_content, _ = resolved
 
-        context_messages.append({"role": Role.USER.value, "content": user_input})
+    orientation = {
+        "role": Role.SYSTEM.value,
+        "content": (
+            "You are a helpful assistant. "
+            "On each turn you may be provided with additional context:\n"
+            "- Long-term memories: facts extracted from previous conversations "
+            "with this user\n"
+            "- Recent conversation history: the last few turns verbatim\n"
+            "- Knowledge base documents: relevant documents retrieved for this "
+            "specific question\n"
+            "Use all provided context to give the most accurate and helpful "
+            "answer possible."
+        ),
+    }
 
-        messages = context_messages
-        resolved_answer: str | None = None
-        loop = asyncio.get_running_loop()
-        if self.mcp_tools:
-            for _ in range(settings.server_tool_call_max_loops):
-                probe_response = await loop.run_in_executor(
-                    self.thread_pool,
-                    lambda msgs=messages: self.client.chat(
-                        model=self.model,
-                        messages=msgs,
-                        stream=False,
-                        options={"num_ctx": settings.server_ollama_num_ctx},
-                    ),
-                )
-                assistant_text = probe_response["message"]["content"]
-                tool_calls = parse_tool_calls(assistant_text)
+    messages: list[dict] = [orientation]
 
-                if not tool_calls:
-                    if not assistant_text.strip().startswith("{"):
-                        resolved_answer = assistant_text
-                    break
+    if long_term_content:
+        messages.append({"role": Role.SYSTEM.value, "content": long_term_content})
 
-                logger.info(
-                    "Session %s: executing %d tool call(s): %s",
-                    self.session_id,
-                    len(tool_calls),
-                    [c.name for c in tool_calls],
-                )
+    if window_content:
+        try:
+            window_turns = json.loads(window_content)
+            messages.extend(window_turns)
+        except (json.JSONDecodeError, TypeError):
+            logger.warning("Could not parse window content from MCP tool.")
 
-                tool_result_messages = await self._execute_tool_calls(tool_calls)
-                messages = (
-                    messages
-                    + [{"role": Role.ASSISTANT.value, "content": assistant_text}]
-                    + tool_result_messages
-                )
+    messages.append({"role": Role.USER.value, "content": user_input})
 
-        mcp_session = self.mcp_session
+    return {"messages": messages}
 
-        async def _stream_tokens(
-            ollama_messages: list[dict],
-        ) -> AsyncGenerator[str, None]:
-            """Stream tokens from Ollama incrementally via a queue.
 
-            The background thread pushes each chunk into the queue as it arrives
-            so the async generator can yield tokens to the caller without waiting
-            for the entire response to be generated first.  A ``None`` sentinel
-            signals end-of-stream; an ``Exception`` signals a streaming error.
-            """
-            queue: asyncio.Queue[str | None | Exception] = asyncio.Queue()
-            current_loop = asyncio.get_running_loop()
+async def decide_tools_node(state: GraphState) -> dict:
+    """Ask FunctionGemma whether any tools should be called.
 
-            def _run() -> None:
-                try:
-                    stream = self.client.chat(
-                        model=self.model,
-                        messages=ollama_messages,
-                        stream=True,
-                        options={"num_ctx": settings.server_ollama_num_ctx},
-                    )
-                    for chunk in stream:
-                        current_loop.call_soon_threadsafe(
-                            queue.put_nowait, chunk["message"]["content"]
-                        )
-                except Exception as exc:
-                    current_loop.call_soon_threadsafe(queue.put_nowait, exc)
-                finally:
-                    current_loop.call_soon_threadsafe(queue.put_nowait, None)
+    Passes the full message list and MCP tool schemas to FunctionGemma via the
+    standard Ollama `tools=` parameter.  Ollama abstracts FunctionGemma's
+    internal token format and returns tool calls via `response.message.tool_calls`.
 
-            self.thread_pool.submit(_run)
+    Returns tool_results with the parsed ToolCall list stored under the key
+    ``_pending`` for the execute_tools_node to consume, or an empty list
+    if FunctionGemma decided no tool call is needed.
+    """
+    client = state["ollama_client"]
+    model = state["function_calling_model"]
+    messages = state["messages"] + state["tool_results"]
+    ollama_schemas = mcp_tools_to_ollama_schemas(state["mcp_tools"])
 
-            while True:
-                item = await queue.get()
-                if item is None:
-                    break
-                if isinstance(item, Exception):
-                    raise item
-                yield item
+    response = await client.chat(
+        model=model,
+        messages=messages,
+        tools=ollama_schemas,
+        stream=False,
+        options={"num_ctx": settings.server_ollama_num_ctx},
+    )
 
-        async def _persisting_stream() -> AsyncGenerator[str, None]:
-            assembled = ""
-            if resolved_answer is not None:
-                assembled = resolved_answer
-                yield resolved_answer
-            else:
-                streamed_tokens: list[str] = []
-                async for token in _stream_tokens(messages):
-                    streamed_tokens.append(token)
+    raw_tool_calls = response.message.tool_calls or []
+    pending: list[ToolCall] = []
+    for tc in raw_tool_calls:
+        call_id = str(uuid.uuid4())
+        name = tc.function.name
+        arguments = dict(tc.function.arguments) if tc.function.arguments else {}
+        pending.append(ToolCall(id=call_id, name=name, arguments=arguments))
 
-                streamed_text = "".join(streamed_tokens)
+    if pending:
+        logger.info(
+            "Session %s: FunctionGemma requested %d tool call(s): %s",
+            state["session_id"],
+            len(pending),
+            [c.name for c in pending],
+        )
 
-                if parse_tool_calls(streamed_text):
-                    logger.warning(
-                        "Session %s: model still returning tool calls after loop cap; "
-                        "forcing plain-text answer.",
-                        session_id_str,
-                    )
-                    forced_messages = messages + [
-                        {"role": Role.ASSISTANT.value, "content": streamed_text},
-                        {
-                            "role": Role.USER.value,
-                            "content": (
-                                "Please answer the original question. "
-                                "Do not call any more tools."
-                            ),
-                        },
-                    ]
-                    forced_response = await loop.run_in_executor(
-                        self.thread_pool,
-                        lambda msgs=forced_messages: self.client.chat(
-                            model=self.model,
-                            messages=msgs,
-                            stream=False,
-                            options={"num_ctx": settings.server_ollama_num_ctx},
-                        ),
-                    )
-                    assembled = forced_response["message"]["content"]
-                    yield assembled
-                else:
-                    assembled = streamed_text
-                    for token in streamed_tokens:
-                        yield token
+    return {"tool_results": state["tool_results"] + [{"_pending": pending}]}
 
-            try:
-                await mcp_session.call_tool(
-                    TOOL_PERSIST_MESSAGE,
-                    arguments={
-                        "session_id": session_id_str,
-                        "role": Role.ASSISTANT.value,
-                        "content": assembled,
-                    },
-                )
-            except Exception as exc:
-                logger.error(
-                    "Failed to persist assistant message (session=%s): %s",
-                    session_id_str,
-                    exc,
-                    exc_info=True,
-                )
 
-        return _persisting_stream()
+def _route_after_decide(
+    state: GraphState,
+) -> Literal["execute_tools", "generate_response"]:
+    """Route to execute_tools if pending calls exist, otherwise generate_response."""
+    tool_results = state["tool_results"]
+    if tool_results:
+        last = tool_results[-1]
+        pending = last.get("_pending", [])
+        if pending:
+            return "execute_tools"
+    return "generate_response"
+
+
+def _route_after_execute(
+    state: GraphState,
+) -> Literal["decide_tools", "generate_response"]:
+    """Route back to decide_tools while under the loop cap, else generate_response."""
+    if state["loop_count"] < settings.server_tool_call_max_loops:
+        return "decide_tools"
+    return "generate_response"
+
+
+async def execute_tools_node(state: GraphState) -> dict:
+    """Execute all pending tool calls concurrently via MCP.
+
+    Pops the ``_pending`` sentinel from tool_results and replaces it with the
+    actual tool result messages.  Unknown tools and execution failures are
+    returned as error strings so the model can decide how to proceed.
+    """
+    mcp_session = state["mcp_session"]
+    session_id = state["session_id"]
+
+    tool_results = list(state["tool_results"])
+    pending_entry = tool_results.pop()
+    pending: list[ToolCall] = pending_entry.get("_pending", [])
+
+    known_names = {t.name for t in state["mcp_tools"]}
+
+    async def _run_one(call: ToolCall) -> dict:
+        if call.name not in known_names:
+            available = ", ".join(sorted(known_names)) or "none"
+            error = (
+                f"ERROR: Unknown tool '{call.name}'. Available tools are: {available}"
+            )
+            return build_tool_result_message(call.id, call.name, error)
+
+        try:
+            result = await mcp_session.call_tool(call.name, arguments=call.arguments)
+            first_content = result.content[0] if result.content else None
+            content = (
+                first_content.text if isinstance(first_content, TextContent) else ""
+            )
+            if not content:
+                content = "No results found. Answer the user's question using your own knowledge."
+            return build_tool_result_message(call.id, call.name, content)
+        except Exception as exc:
+            logger.warning(
+                "Tool call '%s' failed (session=%s, arguments=%s): %s",
+                call.name,
+                session_id,
+                call.arguments,
+                exc,
+            )
+            error = (
+                f"ERROR: Tool '{call.name}' failed with: {exc}. "
+                "Continue with the information you have."
+            )
+            return build_tool_result_message(call.id, call.name, error)
+
+    new_results = list(await asyncio.gather(*(_run_one(c) for c in pending)))
+    return {
+        "tool_results": tool_results + new_results,
+        "loop_count": state["loop_count"] + 1,
+    }
+
+
+async def generate_response_node(state: GraphState) -> dict:
+    """Stream the final response from the chat model.
+
+    Combines the base messages with any accumulated tool result messages before
+    calling the chat model. Streams tokens directly from Ollama without buffering.
+
+    Note: Persistence of the assistant message happens in run_chat_graph after
+    all tokens have been collected, ensuring the full message is available.
+    """
+    client = state["ollama_client"]
+    model = state["chat_model"]
+
+    tool_result_messages = [r for r in state["tool_results"] if "_pending" not in r]
+    messages = state["messages"] + tool_result_messages
+
+    assembled_tokens: list[str] = []
+    stream = await client.chat(
+        model=model,
+        messages=messages,
+        stream=True,
+        options={"num_ctx": settings.server_ollama_num_ctx},
+    )
+    async for chunk in stream:
+        token = chunk.message.content or ""
+        assembled_tokens.append(token)
+
+    assembled = "".join(assembled_tokens)
+    return {"resolved_answer": assembled}
+
+
+def build_chat_graph() -> CompiledStateGraph:
+    """Assemble the LangGraph state graph for one chat turn."""
+    graph = StateGraph(GraphState)
+
+    graph.add_node("load_context", load_context_node)
+    graph.add_node("decide_tools", decide_tools_node)
+    graph.add_node("execute_tools", execute_tools_node)
+    graph.add_node("generate_response", generate_response_node)
+
+    graph.set_entry_point("load_context")
+
+    graph.add_conditional_edges(
+        "load_context",
+        lambda state: "decide_tools" if state["mcp_tools"] else "generate_response",
+        {"decide_tools": "decide_tools", "generate_response": "generate_response"},
+    )
+
+    graph.add_conditional_edges(
+        "decide_tools",
+        _route_after_decide,
+        {"execute_tools": "execute_tools", "generate_response": "generate_response"},
+    )
+
+    graph.add_conditional_edges(
+        "execute_tools",
+        _route_after_execute,
+        {"decide_tools": "decide_tools", "generate_response": "generate_response"},
+    )
+    graph.add_edge("generate_response", END)
+
+    return graph.compile()
+
+
+_chat_graph = build_chat_graph()
+
+
+async def run_chat_graph(
+    session_id: uuid.UUID,
+    user_input: str,
+    mcp_session: ClientSession,
+    ollama_client: AsyncClient,
+    chat_model: str,
+    function_calling_model: str,
+    mcp_tools: list[Tool],
+) -> AsyncGenerator[str, None]:
+    """Run one chat turn through the LangGraph graph and stream tokens incrementally.
+
+    Uses LangGraph's `astream()` API to emit tokens as the chat model generates them,
+    rather than buffering until completion. After streaming is complete, persists
+    the full assembled answer via MCP.
+
+    Yields token strings character-by-character as they become available.
+    """
+    initial_state: GraphState = {
+        "session_id": str(session_id),
+        "user_input": user_input,
+        "mcp_session": mcp_session,
+        "ollama_client": ollama_client,
+        "chat_model": chat_model,
+        "function_calling_model": function_calling_model,
+        "mcp_tools": mcp_tools,
+        "messages": [],
+        "tool_results": [],
+        "loop_count": 0,
+        "resolved_answer": None,
+    }
+
+    last_answer = ""
+    final_answer = None
+
+    async for state in _chat_graph.astream(initial_state, stream_mode="values"):
+        answer = state.get("resolved_answer")
+        if answer is None:
+            continue
+
+        # Convert to string if needed
+        if not isinstance(answer, str):
+            continue
+
+        # Emit incremental updates: new text since last emission
+        if answer.startswith(last_answer):
+            new_text = answer[len(last_answer) :]
+        else:
+            # Fallback if the answer was modified non-monotonically (shouldn't happen)
+            new_text = answer
+
+        if new_text:
+            for char in new_text:
+                yield char
+
+        last_answer = answer
+        final_answer = answer
+
+    # Persist the complete assistant message after streaming finishes
+    if final_answer:
+        try:
+            await mcp_session.call_tool(
+                TOOL_PERSIST_MESSAGE,
+                arguments={
+                    "session_id": str(session_id),
+                    "role": Role.ASSISTANT.value,
+                    "content": final_answer,
+                },
+            )
+        except Exception as exc:
+            logger.error(
+                "Failed to persist assistant message (session=%s): %s",
+                session_id,
+                exc,
+                exc_info=True,
+            )

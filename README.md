@@ -4,23 +4,36 @@ Personal project where I experiment with LLMs locally.
 
 ## Architecture
 
-The project is split into four packages in a `uv` workspace:
+The project is split into five packages in a `uv` workspace:
 
-- **`server/`** — FastAPI HTTP server. Owns all chat logic: session management, conversation memory (Mem0 with PGVector), RAG retrieval (pgvector), summarisation, and streaming responses via SSE. Runs in Docker.
+- **`server/`** — FastAPI HTTP server. Owns all chat logic: session management, conversation memory, RAG context injection, tool calling orchestration, and streaming responses via SSE. Runs in Docker.
+- **`mcp/`** — FastMCP tool server. Exposes memory and RAG tools over StreamableHTTP. Holds the dual-memory system (verbatim sliding window in Postgres + Mem0 semantic fact extraction in PGVector) and the RAG knowledge base. Runs in Docker.
 - **`cli/`** — Thin terminal REPL. Sends user input to the server and renders the streamed response. Named sessions are stored in a local JSON registry at `~/.localllm_sessions.json` (these UUIDs are used as Mem0 user IDs on the server).
 - **`rag/`** — One-shot pipeline that scrapes websites and ingests content into the pgvector store.
-- **`common/`** — Shared utilities used by `server` and `rag`.
+- **`common/`** — Shared utilities used by `server`, `mcp`, and `rag`.
+
+### Tool Calling
+
+Each chat turn runs through a **LangGraph state machine** with two distinct model roles:
+
+- **`functiongemma`** (`SERVER_FUNCTION_CALLING_MODEL`) — a dedicated function-calling model that silently decides whether to invoke tools and with what arguments. It never produces user-visible text.
+- **`custom-chatbot-model`** (`SERVER_OLLAMA_MODEL`) — the main chat model that generates and streams the final answer. It receives the enriched context (history + memories + any tool results) but never sees the tool schemas.
+
+The only tool currently exposed to `functiongemma` is **`search_knowledge_base`**, which searches the RAG vector store. The three memory tools (`load_conversation_window`, `load_long_term_memory`, `persist_message`) are tagged `internal` and called directly by the graph — the model never decides when to use them.
+
+The decision loop can repeat up to `SERVER_TOOL_CALL_MAX_LOOPS` times, allowing chained tool calls before the chat model generates its final response.
 
 ## Features
 
 - **Interactive CLI chat interface** - Have conversations with a local LLM in your terminal, optionally enriched with your own data via RAG.
 - **Named sessions** - Save and resume conversations by name with `--session <name>`. Each run without a name starts a fresh session.
-- **Knowledge Base Integration** - Automatically import content from websites to let the assistant answer questions based on your custom data sources.
-- **Conversation history management** - Automatically summarizes old messages when the conversation gets long to maintain context.
-- **Persistent sessions** - Conversation memory is stored in Mem0 (backed by PGVector in PostgreSQL) and survives CLI restarts. Note: Mem0 stores extracted semantic memories rather than a verbatim transcript.
-- **Customizable system prompt** - The assistant has a friendly, helpful personality.
+- **Knowledge base integration** - Automatically import content from websites to let the assistant answer questions based on your custom data sources.
+- **Tool calling** - A dedicated function-calling model silently decides whether to search the knowledge base to ground each answer. The main chat model then receives the enriched context and streams its reply.
+- **Dual memory system** - Each turn loads a sliding window of recent verbatim turns (Postgres) and extracted long-term semantic facts (Mem0/PGVector). Memory persists across CLI restarts.
+- **Persistent sessions** - Session UUIDs map to Mem0 user IDs, so memories survive restarts and are tied to named sessions.
+- **Customizable system prompt** - The assistant has a friendly, helpful personality defined in `Modelfile`.
 - **No internet required** - Everything runs locally with Docker and Ollama.
-- **Flexible model selection** - Easy to switch between different Ollama models.
+- **Flexible model selection** - Easy to switch between different Ollama models for each role (chat, function calling, embeddings).
 
 ## Quick Start
 
@@ -37,7 +50,7 @@ The project is split into four packages in a `uv` workspace:
    cp .env.example .env
    ```
 
-2. **Start all Docker services** (Ollama, PostgreSQL, and the server):
+2. **Start all Docker services** (Ollama, PostgreSQL, MCP server, and the chat server):
    ```bash
    make setup
    ```
@@ -105,22 +118,22 @@ make run-cli SESSION_ARGS='--session project-x'
 
 All sessions are stored in `~/.localllm_sessions.json` and cached for fast startup (default: 300 seconds). These UUIDs are used as Mem0 user IDs on the server. See `cli/README.md` for detailed documentation on session management, caching, and performance.
 
-### Stopping the Services
-
-```bash
-make down
-```
-
 ## Make Targets
 
 | Target | Description |
 |--------|-------------|
-| `make setup` | Bring all Docker services up in the background (detached) |
+| `make setup` | Build and start all Docker services in production mode |
+| `make dev` | Rebuild and start `server` and `mcp` in dev mode with hot-reload |
 | `make down` | Stop and remove all Docker containers |
 | `make sync-deps` | Install / sync all workspace dependencies via `uv sync` |
 | `make run-cli [SESSION_ARGS='--session <name>']` | Start the interactive CLI chat REPL. Optionally pass `SESSION_ARGS` to load or create a named session. |
+| `make run-mcp` | Run the MCP tool server locally (outside Docker) |
 | `make run-rag` | Run the RAG ingestion pipeline |
 | `make test` | Run the full test suite with pytest |
+| `make test-cli` | Run CLI tests only |
+| `make test-mcp` | Run MCP server tests only |
+| `make test-server` | Run chat server tests only |
+| `make test-rag` | Run RAG pipeline tests only |
 
 ## Configuration
 
@@ -133,23 +146,34 @@ Configured via environment variables in a `.env` file. Copy `.env.example` to ge
 ### PostgreSQL / Mem0 PGVector
 
 - `PG_HOST`, `PG_PORT`, `PG_DATABASE`, `PG_USER`, `PG_PASSWORD` — database connection details.
-- `PG_COLLECTION_NAME` — table name for pgvector embeddings (used by RAG pipeline).
-- `MEM0_COLLECTION_NAME` — collection name used by Mem0 to store chat memories in the same Postgres/PGVector instance.
+- `PG_COLLECTION_NAME` — table name for pgvector embeddings (used by RAG pipeline and knowledge base search).
+- `MEM0_COLLECTION_NAME` — PGVector collection used by Mem0 to store extracted semantic memories.
+- `MEM0_LLM_MODEL` — Ollama model used by Mem0 internally to extract semantic facts from conversations.
 
 ### RAG Pipeline
 
-- `RAG_OLLAMA_MODEL` — Ollama model used to generate embeddings.
+- `RAG_OLLAMA_MODEL` — Ollama model used to generate embeddings (also used by Mem0 for vector storage).
 - `CONCURRENT_REQUESTS` — number of concurrent requests when scraping websites.
 - `REQUEST_DELAY` — delay in seconds between scrape requests.
+- `CHUNKER_BREAKPOINT_TYPE` — chunking strategy for the semantic chunker (default: `percentile`).
+- `CHUNKER_BREAKPOINT_AMOUNT` — threshold value for the chunker (default: `60.0`).
+
+### MCP Server
+
+- `MCP_HOST` / `MCP_PORT` — host and port the MCP server binds to inside Docker.
+- `MCP_ENABLE_RAG` — set to `true` to enable the RAG knowledge base (requires the RAG pipeline to have been run first).
+- `MCP_SERVER_URL` — URL the chat server uses to connect to the MCP server.
+- `RAG_K` — number of top documents to retrieve per knowledge base query.
+- `RAG_MAX_DISTANCE` — maximum cosine similarity distance for a document to be considered relevant.
 
 ### Server
 
-- `SERVER_OLLAMA_MODEL` — Ollama model used for chat responses.
-- `SERVER_MAX_RECENT` — number of recent messages to retain before summarising.
-- `SERVER_THRESHOLD` — total message count that triggers summarisation.
-- `SERVER_ENABLE_RAG` — set to `true` to enable RAG context injection (requires the RAG pipeline to have been run first).
-- `SERVER_RAG_MAX_DISTANCE` — maximum similarity distance for a document to be considered relevant.
-- `SERVER_RAG_K` — number of top documents to retrieve per query.
+- `SERVER_OLLAMA_MODEL` — Ollama model used to generate chat responses.
+- `SERVER_FUNCTION_CALLING_MODEL` — Ollama model used to decide tool calls (default: `functiongemma`).
+- `SERVER_OLLAMA_NUM_CTX` — context window size for Ollama model calls (default: `8192`).
+- `SERVER_MEMORY_WINDOW_SIZE` — number of recent verbatim turns loaded into context per request (default: `10`).
+- `SERVER_MEMORY_LONG_TERM_MAX` — maximum number of Mem0 semantic facts injected as a system message (default: `3`).
+- `SERVER_TOOL_CALL_MAX_LOOPS` — maximum number of decide→execute tool-call loop iterations before forcing a response.
 - `SERVER_HOST` / `SERVER_PORT` — host and port the server binds to inside Docker.
 
 ### CLI
@@ -162,7 +186,7 @@ Configured via environment variables in a `.env` file. Copy `.env.example` to ge
 
 ### Dependency Management
 
-The project is a `uv` workspace with four members: `cli`, `common`, `rag`, and `server`. To install all dependencies into the shared virtual environment:
+The project is a `uv` workspace with five members: `cli`, `common`, `mcp`, `rag`, and `server`. To install all dependencies into the shared virtual environment:
 
 ```bash
 make sync-deps
@@ -176,6 +200,16 @@ make test
 
 ### Changing the Model
 
+There are three distinct model roles, each configurable independently:
+
+| Role | Variable | Default | Purpose |
+|------|----------|---------|---------|
+| Chat / response | `SERVER_OLLAMA_MODEL` | `custom-chatbot-model` | Generates the user-visible streamed answer |
+| Tool calling | `SERVER_FUNCTION_CALLING_MODEL` | `functiongemma` | Decides whether and how to call tools |
+| Embeddings | `RAG_OLLAMA_MODEL` | `embeddinggemma` | Generates embeddings for RAG ingestion, retrieval, and Mem0 memory storage |
+
+To swap a model:
+
 1. Find available models on [Ollama's model library](https://ollama.com/library).
 
 2. Pull the model into the running container:
@@ -183,12 +217,8 @@ make test
    docker compose exec ollama ollama pull <model-name>
    ```
 
-3. Update `SERVER_OLLAMA_MODEL` in your `.env` file:
-   ```
-   SERVER_OLLAMA_MODEL=<model-name>
-   ```
-
-4. Restart the server container to pick up the change:
+3. Update the relevant variable in your `.env` file and restart the affected service:
    ```bash
-   docker compose restart server
+   docker compose restart server   # for SERVER_OLLAMA_MODEL or SERVER_FUNCTION_CALLING_MODEL
+   docker compose restart mcp      # for RAG_OLLAMA_MODEL or MEM0_LLM_MODEL
    ```

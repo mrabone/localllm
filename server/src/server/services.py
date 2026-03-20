@@ -1,6 +1,5 @@
 import asyncio
 import logging
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from typing import Annotated, AsyncGenerator
 
@@ -8,7 +7,7 @@ from fastapi import Depends, FastAPI, HTTPException
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 from mcp.types import Tool
-from ollama import Client
+from ollama import AsyncClient
 
 from common.db import build_pg_dsn
 from common.db_pool import close_pool, init_pool
@@ -85,33 +84,33 @@ class ServiceContainer:
 
     def __init__(
         self,
-        ollama_client: Client,
+        ollama_client: AsyncClient,
         mcp_session: ClientSession,
         pg_dsn: str,
         mcp_tools: list[Tool],
-        thread_pool: ThreadPoolExecutor,
+        function_calling_model: str,
     ) -> None:
         self.ollama_client = ollama_client
         self.mcp_session = mcp_session
         self.pg_dsn = pg_dsn
         self.mcp_tools = mcp_tools
-        self.thread_pool = thread_pool
+        self.function_calling_model = function_calling_model
 
     @classmethod
     def initialise(
         cls,
-        ollama_client: Client,
+        ollama_client: AsyncClient,
         mcp_session: ClientSession,
         pg_dsn: str,
         mcp_tools: list[Tool],
-        thread_pool: ThreadPoolExecutor,
+        function_calling_model: str,
     ) -> "ServiceContainer":
         cls._instance = cls(
             ollama_client=ollama_client,
             mcp_session=mcp_session,
             pg_dsn=pg_dsn,
             mcp_tools=mcp_tools,
-            thread_pool=thread_pool,
+            function_calling_model=function_calling_model,
         )
         return cls._instance
 
@@ -135,15 +134,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Connect to shared services on startup and disconnect on shutdown."""
     logger.info("Starting server, connecting to services...")
 
-    ollama_client = Client(host=settings.ollama_base_url)
-    logger.info("Ollama client initialised (host=%s).", settings.ollama_base_url)
+    ollama_client = AsyncClient(host=settings.ollama_base_url)
+    logger.info("Ollama async client initialised (host=%s).", settings.ollama_base_url)
 
     pg_dsn = build_pg_dsn(settings)
     init_pool(pg_dsn)
     ensure_turns_table(pg_dsn)
     logger.info("PostgreSQL pool and schema ready.")
-
-    thread_pool = ThreadPoolExecutor()
 
     mcp_url = f"{settings.mcp_server_url}/mcp"
     logger.info("Connecting to MCP server at %s...", mcp_url)
@@ -154,7 +151,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                 mcp_session=session,
                 pg_dsn=pg_dsn,
                 mcp_tools=mcp_tools,
-                thread_pool=thread_pool,
+                function_calling_model=settings.server_function_calling_model,
             )
 
             yield
@@ -163,12 +160,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         raise
     finally:
         ServiceContainer.reset()
-        thread_pool.shutdown(wait=True)
         close_pool()
         logger.info("Server shut down.")
 
 
-def get_ollama_client() -> Client:
+def get_ollama_client() -> AsyncClient:
     container = ServiceContainer.get_or_none()
     if container is None:
         raise HTTPException(status_code=503, detail="services not initialised")
@@ -208,15 +204,15 @@ def get_mcp_tools() -> list[Tool]:
     return [t for t in container.mcp_tools if not _is_internal_tool(t)]
 
 
-def get_thread_pool() -> ThreadPoolExecutor:
+def get_function_calling_model() -> str:
     container = ServiceContainer.get_or_none()
     if container is None:
         raise HTTPException(status_code=503, detail="services not initialised")
-    return container.thread_pool
+    return container.function_calling_model
 
 
-OllamaClientDep = Annotated[Client, Depends(get_ollama_client)]
+OllamaClientDep = Annotated[AsyncClient, Depends(get_ollama_client)]
 McpSessionDep = Annotated[ClientSession, Depends(get_mcp_session)]
 PgDsnDep = Annotated[str, Depends(get_pg_dsn)]
 McpToolsDep = Annotated[list[Tool], Depends(get_mcp_tools)]
-ThreadPoolDep = Annotated[ThreadPoolExecutor, Depends(get_thread_pool)]
+FunctionCallingModelDep = Annotated[str, Depends(get_function_calling_model)]
