@@ -112,7 +112,7 @@ async def chat(
 
     async def event_generator() -> AsyncGenerator[dict, None]:
         try:
-            token_stream = await run_chat_graph(
+            token_stream = run_chat_graph(
                 session_id=session_id,
                 user_input=body.message,
                 mcp_session=mcp_session,

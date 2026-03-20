@@ -602,6 +602,11 @@ class TestGenerateResponseNode:
             assert "_pending" not in msg
 
     async def test_assistant_message_persisted_after_stream(self):
+        """Persistence now happens in run_chat_graph after streaming completes.
+
+        This test verifies that generate_response_node only returns the assembled
+        answer; persistence is handled at the graph orchestration level.
+        """
         state = _make_base_state(
             messages=[{"role": "user", "content": "hi"}],
         )
@@ -611,17 +616,18 @@ class TestGenerateResponseNode:
         call_tool_mock = AsyncMock(return_value=_make_empty_tool_result())
         state["mcp_session"].call_tool = call_tool_mock
 
-        await generate_response_node(state)
+        result = await generate_response_node(state)
 
+        # generate_response_node should return the assembled answer
+        assert result["resolved_answer"] == "Hello there"
+
+        # Persistence is NOT done by generate_response_node itself;
+        # it happens in run_chat_graph after all tokens are assembled.
+        # So we should NOT see persist_message calls here.
         persist_calls = [
             c for c in call_tool_mock.await_args_list if c.args[0] == "persist_message"
         ]
-        assistant_persist = next(
-            (c for c in persist_calls if c.kwargs["arguments"]["role"] == "assistant"),
-            None,
-        )
-        assert assistant_persist is not None
-        assert assistant_persist.kwargs["arguments"]["content"] == "Hello there"
+        assert len(persist_calls) == 0, "generate_response_node should not persist"
 
     async def test_persist_failure_does_not_raise(self):
         """An error persisting the assistant message must not propagate to the caller."""

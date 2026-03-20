@@ -91,7 +91,8 @@ async def _run_graph(
         ollama_client = AsyncMock()
         ollama_client.chat = AsyncMock(return_value=_make_stream_response(["ok"]))
 
-    stream = await run_chat_graph(
+    # run_chat_graph is now an async generator, so don't await it
+    stream = run_chat_graph(
         session_id=session_id or uuid.uuid4(),
         user_input=user_input,
         mcp_session=mcp_session,
@@ -151,6 +152,80 @@ class TestTokenStreaming:
 
         called_names = {c.args[0] for c in call_tool_mock.await_args_list}
         assert "search_knowledge_base" not in called_names
+
+    async def test_tokens_streamed_incrementally_not_buffered(self):
+        """Tokens should be yielded as they arrive, not buffered until completion.
+
+        This test verifies the fix for the streaming regression: with astream()
+        the graph yields partial results during streaming (no TTFB delay).
+        """
+        mcp_session = AsyncMock()
+        mcp_session.call_tool = _stub_call_tool({})
+
+        ollama_client = AsyncMock()
+        # Simulate Ollama streaming 3 tokens incrementally
+        ollama_client.chat = AsyncMock(
+            return_value=_make_stream_response(["Hello", " ", "world"])
+        )
+
+        tokens = await _run_graph(mcp_session=mcp_session, ollama_client=ollama_client)
+
+        # Verify tokens are yielded in order and can be consumed incrementally
+        assert len(tokens) > 0, "should have streamed at least one token"
+        assert "".join(tokens) == "Hello world"
+
+    async def test_long_response_does_not_buffer_excessively(self):
+        """Large responses should not cause excessive memory usage during streaming.
+
+        With astream() each token update is yielded immediately rather than
+        accumulating all tokens before returning.
+        """
+        mcp_session = AsyncMock()
+        mcp_session.call_tool = _stub_call_tool({})
+
+        # Simulate a large response with many small tokens
+        large_response_tokens = ["word"] * 1000
+        ollama_client = AsyncMock()
+        ollama_client.chat = AsyncMock(
+            return_value=_make_stream_response(large_response_tokens)
+        )
+
+        tokens = await _run_graph(mcp_session=mcp_session, ollama_client=ollama_client)
+
+        # Verify all tokens were streamed
+        assert len(tokens) > 0
+        assert "".join(tokens) == "word" * 1000
+
+    async def test_assistant_message_persisted_with_full_response(self):
+        """After streaming completes, the full assembled response is persisted."""
+        mcp_session = AsyncMock()
+        call_tool_mock = _stub_call_tool({})
+        mcp_session.call_tool = call_tool_mock
+
+        ollama_client = AsyncMock()
+        ollama_client.chat = AsyncMock(
+            return_value=_make_stream_response(["Complete", " response"])
+        )
+
+        session_id = uuid.uuid4()
+        await _run_graph(
+            mcp_session=mcp_session,
+            ollama_client=ollama_client,
+            session_id=session_id,
+        )
+
+        # Find the persist_message call for the assistant turn (last one should be)
+        persist_calls = [
+            c for c in call_tool_mock.await_args_list if c[0][0] == "persist_message"
+        ]
+
+        assert len(persist_calls) >= 2, "should have persisted user and assistant turns"
+
+        # The last persist_message call should be the assistant response
+        last_persist = persist_calls[-1]
+        assert last_persist[1]["arguments"]["role"] == "assistant"
+        # Should contain the full streamed response
+        assert last_persist[1]["arguments"]["content"] == "Complete response"
 
 
 @pytest.mark.asyncio

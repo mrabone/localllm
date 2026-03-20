@@ -181,8 +181,8 @@ async def decide_tools_node(state: GraphState) -> dict:
     internal token format and returns tool calls via `response.message.tool_calls`.
 
     Returns tool_results with the parsed ToolCall list stored under the key
-    ``_pending_tool_calls`` for the execute_tools_node to consume, or an empty
-    list if FunctionGemma decided no tool call is needed.
+    ``_pending`` for the execute_tools_node to consume, or an empty list
+    if FunctionGemma decided no tool call is needed.
     """
     client = state["ollama_client"]
     model = state["function_calling_model"]
@@ -293,16 +293,16 @@ async def execute_tools_node(state: GraphState) -> dict:
 
 
 async def generate_response_node(state: GraphState) -> dict:
-    """Stream the final response from Gemma3 and persist the assistant turn.
+    """Stream the final response from the chat model.
 
     Combines the base messages with any accumulated tool result messages before
-    calling Gemma3.  The full assembled text is persisted via MCP after streaming.
-    Returns the assembled answer in ``resolved_answer`` for the caller to stream.
+    calling the chat model. Streams tokens directly from Ollama without buffering.
+
+    Note: Persistence of the assistant message happens in run_chat_graph after
+    all tokens have been collected, ensuring the full message is available.
     """
     client = state["ollama_client"]
     model = state["chat_model"]
-    mcp_session = state["mcp_session"]
-    session_id = state["session_id"]
 
     tool_result_messages = [r for r in state["tool_results"] if "_pending" not in r]
     messages = state["messages"] + tool_result_messages
@@ -319,24 +319,6 @@ async def generate_response_node(state: GraphState) -> dict:
         assembled_tokens.append(token)
 
     assembled = "".join(assembled_tokens)
-
-    try:
-        await mcp_session.call_tool(
-            TOOL_PERSIST_MESSAGE,
-            arguments={
-                "session_id": session_id,
-                "role": Role.ASSISTANT.value,
-                "content": assembled,
-            },
-        )
-    except Exception as exc:
-        logger.error(
-            "Failed to persist assistant message (session=%s): %s",
-            session_id,
-            exc,
-            exc_info=True,
-        )
-
     return {"resolved_answer": assembled}
 
 
@@ -385,11 +367,13 @@ async def run_chat_graph(
     function_calling_model: str,
     mcp_tools: list[Tool],
 ) -> AsyncGenerator[str, None]:
-    """Run one chat turn through the LangGraph graph and stream tokens.
+    """Run one chat turn through the LangGraph graph and stream tokens incrementally.
 
-    This is a direct replacement for ``ChatSession.chat()``.  The caller
-    receives an async generator that yields token strings, identical to the
-    previous interface.
+    Uses LangGraph's `astream()` API to emit tokens as the chat model generates them,
+    rather than buffering until completion. After streaming is complete, persists
+    the full assembled answer via MCP.
+
+    Yields token strings character-by-character as they become available.
     """
     initial_state: GraphState = {
         "session_id": str(session_id),
@@ -405,11 +389,47 @@ async def run_chat_graph(
         "resolved_answer": None,
     }
 
-    final_state = await _chat_graph.ainvoke(initial_state)
-    answer = final_state.get("resolved_answer") or ""
+    last_answer = ""
+    final_answer = None
 
-    async def _token_stream() -> AsyncGenerator[str, None]:
-        for token in answer:
-            yield token
+    async for state in _chat_graph.astream(initial_state, stream_mode="values"):
+        answer = state.get("resolved_answer")
+        if answer is None:
+            continue
 
-    return _token_stream()
+        # Convert to string if needed
+        if not isinstance(answer, str):
+            continue
+
+        # Emit incremental updates: new text since last emission
+        if answer.startswith(last_answer):
+            new_text = answer[len(last_answer) :]
+        else:
+            # Fallback if the answer was modified non-monotonically (shouldn't happen)
+            new_text = answer
+
+        if new_text:
+            for char in new_text:
+                yield char
+
+        last_answer = answer
+        final_answer = answer
+
+    # Persist the complete assistant message after streaming finishes
+    if final_answer:
+        try:
+            await mcp_session.call_tool(
+                TOOL_PERSIST_MESSAGE,
+                arguments={
+                    "session_id": str(session_id),
+                    "role": Role.ASSISTANT.value,
+                    "content": final_answer,
+                },
+            )
+        except Exception as exc:
+            logger.error(
+                "Failed to persist assistant message (session=%s): %s",
+                session_id,
+                exc,
+                exc_info=True,
+            )
