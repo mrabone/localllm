@@ -1,8 +1,11 @@
+import asyncio
+import functools
 import uuid
 
 import httpx
 import uvicorn
 from fastmcp import FastMCP
+from pydantic import BaseModel
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
@@ -30,61 +33,6 @@ setup_logging()
 mcp = FastMCP(name="localllm-mcp", lifespan=lifespan)
 
 
-# These three tools are tagged "internal" so the server-side filter in
-# services._is_internal_tool() excludes them from the tool list passed to
-# FunctionGemma.  The chat graph calls them directly by name on every turn —
-# they are infrastructure, not model-callable capabilities.
-@mcp.tool(tags={"internal"})
-def load_conversation_window(session_id: str, window_size: int = 10) -> list[dict]:
-    """Return the most recent verbatim turns for a session, oldest first.
-
-    Each entry is a dict with ``role`` and ``content`` keys, ready to pass
-    directly into an LLM message list.
-
-    Args:
-        session_id: UUID string of the session.
-        window_size: Maximum number of turns to return.
-    """
-    return load_window(get_pg_dsn(), uuid.UUID(session_id), window_size=window_size)
-
-
-@mcp.tool(tags={"internal"})
-def load_long_term_memory(session_id: str, long_term_max: int = 3) -> str:
-    """Return Mem0-extracted semantic facts for a session as a formatted string.
-
-    Facts are presented as a bullet-point system message.  Returns an empty
-    string if no long-term memories have been stored yet.
-
-    Args:
-        session_id: UUID string of the session.
-        long_term_max: Maximum number of memory facts to include.
-    """
-    messages = load_long_term_memories(
-        get_mem0(), uuid.UUID(session_id), long_term_max=long_term_max
-    )
-    if not messages:
-        return ""
-    return messages[0]["content"]
-
-
-@mcp.tool(tags={"internal"})
-def persist_message(session_id: str, role: str, content: str) -> None:
-    """Persist a single conversation turn to both Mem0 and the verbatim window.
-
-    Mem0 runs an LLM extraction pass to distil semantic facts; the verbatim
-    text is also inserted into the sliding-window PostgreSQL table so it
-    appears in future ``load_conversation_window`` calls.
-
-    Args:
-        session_id: UUID string of the session.
-        role: Message role — ``"user"`` or ``"assistant"``.
-        content: The full text of the message.
-    """
-    parsed_id = uuid.UUID(session_id)
-    save_message(get_mem0(), parsed_id, role, content)
-    append_turn(get_pg_dsn(), parsed_id, role, content)
-
-
 @mcp.tool()
 def search_knowledge_base(query: str) -> str:
     """Search the RAG knowledge base and return relevant document snippets.
@@ -103,6 +51,12 @@ def search_knowledge_base(query: str) -> str:
     if rag_result is None:
         return ""
     return build_rag_system_message(rag_result.context)
+
+
+class PersistMessageRequest(BaseModel):
+    session_id: str
+    role: str
+    content: str
 
 
 def main() -> None:
@@ -147,8 +101,79 @@ def main() -> None:
             status_code=status_code,
         )
 
+    async def get_conversation_window(request: Request) -> JSONResponse:
+        """Return the most recent verbatim turns for a session, oldest first.
+
+        Query parameters:
+            window_size: Maximum number of turns to return (default 10).
+        """
+        session_id = request.path_params["session_id"]
+        window_size = int(request.query_params.get("window_size", 10))
+        turns = load_window(
+            get_pg_dsn(), uuid.UUID(session_id), window_size=window_size
+        )
+        return JSONResponse(turns)
+
+    async def get_long_term_memory(request: Request) -> JSONResponse:
+        """Return Mem0-extracted semantic facts for a session.
+
+        Returns a JSON object with a ``content`` field containing a
+        bullet-point string, or an empty string if no memories exist yet.
+
+        Query parameters:
+            long_term_max: Maximum number of facts to include (default 3).
+        """
+        session_id = request.path_params["session_id"]
+        long_term_max = int(request.query_params.get("long_term_max", 3))
+        messages = load_long_term_memories(
+            get_mem0(), uuid.UUID(session_id), long_term_max=long_term_max
+        )
+        content = messages[0]["content"] if messages else ""
+        return JSONResponse({"content": content})
+
+    async def persist_message(request: Request) -> JSONResponse:
+        """Persist a single conversation turn to both Mem0 and the verbatim window.
+
+        Both writes are dispatched to the default thread-pool executor so that
+        the blocking Mem0 and psycopg2 calls do not stall the event loop.  They
+        run concurrently because they write to independent stores.
+        """
+        body = PersistMessageRequest.model_validate(await request.json())
+        parsed_id = uuid.UUID(body.session_id)
+        loop = asyncio.get_running_loop()
+        await asyncio.gather(
+            loop.run_in_executor(
+                None,
+                functools.partial(
+                    save_message, get_mem0(), parsed_id, body.role, body.content
+                ),
+            ),
+            loop.run_in_executor(
+                None,
+                functools.partial(
+                    append_turn, get_pg_dsn(), parsed_id, body.role, body.content
+                ),
+            ),
+        )
+        return JSONResponse(None, status_code=204)
+
     app = mcp.http_app(path="/mcp")
     app.routes.append(Route("/health", health_check, methods=["GET"]))
+    app.routes.append(
+        Route(
+            "/memory/window/{session_id}",
+            get_conversation_window,
+            methods=["GET"],
+        )
+    )
+    app.routes.append(
+        Route(
+            "/memory/long-term/{session_id}",
+            get_long_term_memory,
+            methods=["GET"],
+        )
+    )
+    app.routes.append(Route("/memory/messages", persist_message, methods=["POST"]))
 
     uvicorn.run(
         app,
