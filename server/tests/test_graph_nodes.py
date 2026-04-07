@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
+import pytest_asyncio
 from langchain_core.runnables import RunnableConfig
 from mcp.types import TextContent, Tool
 
@@ -19,6 +20,18 @@ from server.chat import (
     load_context_node,
     mcp_tools_to_ollama_schemas,
 )
+
+_open_clients: list[httpx.AsyncClient] = []
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def close_memory_clients():
+    """Close any httpx.AsyncClient instances created by _make_memory_client or
+    _make_base_state after each test, to prevent resource-leak warnings."""
+    yield
+    for client in _open_clients:
+        await client.aclose()
+    _open_clients.clear()
 
 
 def _make_node_config() -> tuple[RunnableConfig, asyncio.Queue]:
@@ -77,6 +90,7 @@ def _make_memory_client(
     """Return an httpx.AsyncClient backed by a mock transport.
 
     Stubs the three memory REST endpoints used by load_context_node.
+    The client is registered for automatic cleanup by the close_memory_clients fixture.
     """
 
     async def _transport(request: httpx.Request) -> httpx.Response:
@@ -90,7 +104,9 @@ def _make_memory_client(
         return httpx.Response(404)
 
     transport = httpx.MockTransport(_transport)
-    return httpx.AsyncClient(base_url="http://mcp-test", transport=transport)
+    client = httpx.AsyncClient(base_url="http://mcp-test", transport=transport)
+    _open_clients.append(client)
+    return client
 
 
 def _make_base_state(**overrides) -> GraphState:
@@ -116,21 +132,6 @@ def _make_base_state(**overrides) -> GraphState:
     for key, value in overrides.items():
         state[key] = value  # type: ignore[literal-required]
     return state
-
-
-def _stub_mcp_call_tool(tool_responses: dict):
-    """Return an AsyncMock for MCP call_tool that dispatches by tool name.
-
-    Used only for model-callable tools (e.g. search_knowledge_base).
-    """
-
-    async def _call_tool(name, *, arguments=None, **kwargs):
-        text = tool_responses.get(name, "")
-        if text == "":
-            return _make_empty_tool_result()
-        return _make_tool_result(text)
-
-    return AsyncMock(side_effect=_call_tool)
 
 
 class TestMcpToolsToOllamaSchemas:
@@ -269,13 +270,12 @@ class TestLoadContextNode:
                 return httpx.Response(204)
             return httpx.Response(404)
 
-        state = _make_base_state(
-            user_input="hello",
-            memory_http_client=httpx.AsyncClient(
-                base_url="http://mcp-test",
-                transport=httpx.MockTransport(_transport),
-            ),
+        client = httpx.AsyncClient(
+            base_url="http://mcp-test",
+            transport=httpx.MockTransport(_transport),
         )
+        _open_clients.append(client)
+        state = _make_base_state(user_input="hello", memory_http_client=client)
         result = await load_context_node(state)
         messages = result["messages"]
         assert messages[-1] == {"role": "user", "content": "hello"}
@@ -295,13 +295,12 @@ class TestLoadContextNode:
                 return httpx.Response(204)
             return httpx.Response(404)
 
-        state = _make_base_state(
-            user_input="hello",
-            memory_http_client=httpx.AsyncClient(
-                base_url="http://mcp-test",
-                transport=httpx.MockTransport(_transport),
-            ),
+        client = httpx.AsyncClient(
+            base_url="http://mcp-test",
+            transport=httpx.MockTransport(_transport),
         )
+        _open_clients.append(client)
+        state = _make_base_state(user_input="hello", memory_http_client=client)
         result = await load_context_node(state)
         messages = result["messages"]
         assert messages[0]["role"] == "system"
@@ -320,13 +319,12 @@ class TestLoadContextNode:
                 return httpx.Response(204)
             return httpx.Response(404)
 
-        state = _make_base_state(
-            memory_http_client=httpx.AsyncClient(
-                base_url="http://mcp-test",
-                transport=httpx.MockTransport(_transport),
-            )
+        client = httpx.AsyncClient(
+            base_url="http://mcp-test",
+            transport=httpx.MockTransport(_transport),
         )
-
+        _open_clients.append(client)
+        state = _make_base_state(memory_http_client=client)
         with patch("server.chat.settings") as mock_settings:
             mock_settings.server_memory_long_term_max = 5
             mock_settings.server_memory_window_size = 10
@@ -351,13 +349,12 @@ class TestLoadContextNode:
                 return httpx.Response(204)
             return httpx.Response(404)
 
-        state = _make_base_state(
-            memory_http_client=httpx.AsyncClient(
-                base_url="http://mcp-test",
-                transport=httpx.MockTransport(_transport),
-            )
+        client = httpx.AsyncClient(
+            base_url="http://mcp-test",
+            transport=httpx.MockTransport(_transport),
         )
-
+        _open_clients.append(client)
+        state = _make_base_state(memory_http_client=client)
         with patch("server.chat.settings") as mock_settings:
             mock_settings.server_memory_long_term_max = 3
             mock_settings.server_memory_window_size = 7
@@ -380,14 +377,15 @@ class TestLoadContextNode:
                 return httpx.Response(204)
             return httpx.Response(404)
 
-        state = _make_base_state(
-            user_input="user input",
-            memory_http_client=httpx.AsyncClient(
-                base_url="http://mcp-test",
-                transport=httpx.MockTransport(_transport),
-            ),
+        client = httpx.AsyncClient(
+            base_url="http://mcp-test",
+            transport=httpx.MockTransport(_transport),
         )
-        await load_context_node(state)
+        try:
+            state = _make_base_state(user_input="user input", memory_http_client=client)
+            await load_context_node(state)
+        finally:
+            await client.aclose()
 
         user_persist = next((p for p in persisted if p.get("role") == "user"), None)
         assert user_persist is not None

@@ -101,7 +101,7 @@ async def load_context_node(state: GraphState) -> dict:
             params={"window_size": settings.server_memory_window_size},
         )
         response.raise_for_status()
-        return json.dumps(response.json())
+        return response.text
 
     async def persist_user_message() -> None:
         response = await client.post(

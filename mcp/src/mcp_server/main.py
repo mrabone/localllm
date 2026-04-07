@@ -1,6 +1,7 @@
 import asyncio
 import functools
 import uuid
+from typing import Literal
 
 import httpx
 import uvicorn
@@ -54,8 +55,8 @@ def search_knowledge_base(query: str) -> str:
 
 
 class PersistMessageRequest(BaseModel):
-    session_id: str
-    role: str
+    session_id: uuid.UUID
+    role: Literal["user", "assistant"]
     content: str
 
 
@@ -107,10 +108,16 @@ def main() -> None:
         Query parameters:
             window_size: Maximum number of turns to return (default 10).
         """
-        session_id = request.path_params["session_id"]
-        window_size = int(request.query_params.get("window_size", 10))
-        turns = load_window(
-            get_pg_dsn(), uuid.UUID(session_id), window_size=window_size
+        try:
+            session_id = uuid.UUID(request.path_params["session_id"])
+            window_size = int(request.query_params.get("window_size", 10))
+        except ValueError as exc:
+            return JSONResponse({"detail": str(exc)}, status_code=400)
+        turns = await asyncio.get_running_loop().run_in_executor(
+            None,
+            functools.partial(
+                load_window, get_pg_dsn(), session_id, window_size=window_size
+            ),
         )
         return JSONResponse(turns)
 
@@ -123,10 +130,19 @@ def main() -> None:
         Query parameters:
             long_term_max: Maximum number of facts to include (default 3).
         """
-        session_id = request.path_params["session_id"]
-        long_term_max = int(request.query_params.get("long_term_max", 3))
-        messages = load_long_term_memories(
-            get_mem0(), uuid.UUID(session_id), long_term_max=long_term_max
+        try:
+            session_id = uuid.UUID(request.path_params["session_id"])
+            long_term_max = int(request.query_params.get("long_term_max", 3))
+        except ValueError as exc:
+            return JSONResponse({"detail": str(exc)}, status_code=400)
+        messages = await asyncio.get_running_loop().run_in_executor(
+            None,
+            functools.partial(
+                load_long_term_memories,
+                get_mem0(),
+                session_id,
+                long_term_max=long_term_max,
+            ),
         )
         content = messages[0]["content"] if messages else ""
         return JSONResponse({"content": content})
@@ -139,19 +155,18 @@ def main() -> None:
         run concurrently because they write to independent stores.
         """
         body = PersistMessageRequest.model_validate(await request.json())
-        parsed_id = uuid.UUID(body.session_id)
         loop = asyncio.get_running_loop()
         await asyncio.gather(
             loop.run_in_executor(
                 None,
                 functools.partial(
-                    save_message, get_mem0(), parsed_id, body.role, body.content
+                    save_message, get_mem0(), body.session_id, body.role, body.content
                 ),
             ),
             loop.run_in_executor(
                 None,
                 functools.partial(
-                    append_turn, get_pg_dsn(), parsed_id, body.role, body.content
+                    append_turn, get_pg_dsn(), body.session_id, body.role, body.content
                 ),
             ),
         )

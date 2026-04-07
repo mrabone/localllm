@@ -4,9 +4,22 @@ from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
+import pytest_asyncio
 from mcp.types import TextContent, Tool
 
 from server.chat import Role, run_chat_graph
+
+_open_clients: list[httpx.AsyncClient] = []
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def close_memory_clients():
+    """Close any httpx.AsyncClient instances registered via _make_memory_client
+    or created inline in tests, to prevent resource-leak warnings."""
+    yield
+    for client in _open_clients:
+        await client.aclose()
+    _open_clients.clear()
 
 
 def _make_mcp_tool(
@@ -87,6 +100,7 @@ def _make_memory_client(
     """Return a real httpx.AsyncClient backed by a mock transport.
 
     Stubs the three memory REST endpoints so tests don't need a live server.
+    The client is registered for automatic cleanup by the close_memory_clients fixture.
     """
 
     async def _transport(request: httpx.Request) -> httpx.Response:
@@ -100,7 +114,9 @@ def _make_memory_client(
         return httpx.Response(404)
 
     transport = httpx.MockTransport(_transport)
-    return httpx.AsyncClient(base_url="http://mcp-test", transport=transport)
+    client = httpx.AsyncClient(base_url="http://mcp-test", transport=transport)
+    _open_clients.append(client)
+    return client
 
 
 async def _run_graph(
@@ -169,6 +185,7 @@ class TestTokenStreaming:
             base_url="http://mcp-test",
             transport=httpx.MockTransport(_transport),
         )
+        _open_clients.append(client)
 
         await _run_graph(memory_http_client=client)
 
@@ -233,6 +250,7 @@ class TestTokenStreaming:
             base_url="http://mcp-test",
             transport=httpx.MockTransport(_transport),
         )
+        _open_clients.append(client)
         ollama_client = AsyncMock()
         ollama_client.chat = AsyncMock(
             return_value=_make_stream_response(["Complete", " response"])
@@ -353,6 +371,7 @@ class TestPersistMessages:
             base_url="http://mcp-test",
             transport=httpx.MockTransport(_transport),
         )
+        _open_clients.append(client)
         ollama_client = AsyncMock()
         ollama_client.chat = AsyncMock(return_value=_make_stream_response(["ok"]))
 
@@ -383,6 +402,7 @@ class TestPersistMessages:
             base_url="http://mcp-test",
             transport=httpx.MockTransport(_transport),
         )
+        _open_clients.append(client)
         ollama_client = AsyncMock()
         ollama_client.chat = AsyncMock(
             return_value=_make_stream_response(["Hello", " there"])
@@ -417,6 +437,7 @@ class TestPersistMessages:
             base_url="http://mcp-test",
             transport=httpx.MockTransport(_transport),
         )
+        _open_clients.append(client)
         ollama_client = AsyncMock()
         ollama_client.chat = AsyncMock(return_value=_make_stream_response(["ok"]))
 
