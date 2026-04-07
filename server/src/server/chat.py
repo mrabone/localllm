@@ -313,19 +313,21 @@ async def generate_response_node(state: GraphState, config: RunnableConfig) -> d
     messages = state["messages"] + tool_result_messages
 
     assembled_tokens: list[str] = []
-    stream = await client.chat(
-        model=model,
-        messages=messages,
-        stream=True,
-        options={"num_ctx": settings.server_ollama_num_ctx},
-    )
-    async for chunk in stream:
-        token = chunk.message.content or ""
-        if token:
-            assembled_tokens.append(token)
-            await token_queue.put(token)
+    try:
+        stream = await client.chat(
+            model=model,
+            messages=messages,
+            stream=True,
+            options={"num_ctx": settings.server_ollama_num_ctx},
+        )
+        async for chunk in stream:
+            token = chunk.message.content or ""
+            if token:
+                assembled_tokens.append(token)
+                await token_queue.put(token)
+    finally:
+        await token_queue.put(None)
 
-    await token_queue.put(None)
     assembled = "".join(assembled_tokens)
     return {"resolved_answer": assembled}
 
@@ -411,9 +413,13 @@ async def run_chat_graph(
             if token is None:
                 break
             yield token
-    except Exception:
-        graph_task.cancel()
-        raise
+    finally:
+        if not graph_task.done():
+            graph_task.cancel()
+            try:
+                await graph_task
+            except (asyncio.CancelledError, Exception):
+                pass
 
     final_state = await graph_task
     final_answer = final_state.get("resolved_answer") if final_state else None

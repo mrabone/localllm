@@ -77,6 +77,7 @@ async def _open_mcp_session(
 
     if not result_holder:
         task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
         raise RuntimeError(
             f"Failed to connect to MCP server after {max_retries} attempts"
         ) from last_exception
@@ -98,6 +99,8 @@ class McpSessionPool:
     """
 
     def __init__(self, pool_size: int) -> None:
+        if pool_size < 1:
+            raise ValueError(f"pool_size must be at least 1, got {pool_size}")
         self._pool_size = pool_size
         self._sessions: list[ClientSession] = []
         self._tasks: list[asyncio.Task] = []
@@ -114,10 +117,31 @@ class McpSessionPool:
             *[
                 _open_mcp_session(mcp_url, max_retries=max_retries)
                 for _ in range(self._pool_size)
-            ]
+            ],
+            return_exceptions=True,
         )
+
+        successes: list[tuple[ClientSession, list[Tool], asyncio.Task]] = []
+        errors: list[BaseException] = []
+        for result in open_results:
+            if isinstance(result, BaseException):
+                errors.append(result)
+            else:
+                successes.append(result)
+
+        if errors:
+            for _, _, task in successes:
+                task.cancel()
+            await asyncio.gather(
+                *(task for _, _, task in successes), return_exceptions=True
+            )
+            error_summary = "; ".join(f"{type(err).__name__}: {err}" for err in errors)
+            raise RuntimeError(
+                f"Failed to open MCP session pool: {error_summary}"
+            ) from errors[0]
+
         mcp_tools: list[Tool] = []
-        for i, (session, tools, task) in enumerate(open_results):
+        for i, (session, tools, task) in enumerate(successes):
             self._sessions.append(session)
             self._tasks.append(task)
             await self._queue.put(session)

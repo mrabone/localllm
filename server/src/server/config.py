@@ -49,6 +49,7 @@ class Settings(SharedSettings):
 
     server_mcp_pool_size: int = Field(
         default=4,
+        ge=1,
         alias="SERVER_MCP_POOL_SIZE",
         description=(
             "Number of concurrent MCP client sessions to open at startup. "
