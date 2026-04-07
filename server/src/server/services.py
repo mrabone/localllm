@@ -3,6 +3,7 @@ import logging
 from contextlib import asynccontextmanager
 from typing import Annotated, AsyncGenerator
 
+import httpx
 from fastapi import Depends, FastAPI, HTTPException
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
@@ -180,12 +181,14 @@ class ServiceContainer:
         self,
         ollama_client: AsyncClient,
         mcp_session_pool: McpSessionPool,
+        memory_http_client: httpx.AsyncClient,
         pg_dsn: str,
         mcp_tools: list[Tool],
         function_calling_model: str,
     ) -> None:
         self.ollama_client = ollama_client
         self.mcp_session_pool = mcp_session_pool
+        self.memory_http_client = memory_http_client
         self.pg_dsn = pg_dsn
         self.mcp_tools = mcp_tools
         self.function_calling_model = function_calling_model
@@ -195,6 +198,7 @@ class ServiceContainer:
         cls,
         ollama_client: AsyncClient,
         mcp_session_pool: McpSessionPool,
+        memory_http_client: httpx.AsyncClient,
         pg_dsn: str,
         mcp_tools: list[Tool],
         function_calling_model: str,
@@ -202,6 +206,7 @@ class ServiceContainer:
         cls._instance = cls(
             ollama_client=ollama_client,
             mcp_session_pool=mcp_session_pool,
+            memory_http_client=memory_http_client,
             pg_dsn=pg_dsn,
             mcp_tools=mcp_tools,
             function_calling_model=function_calling_model,
@@ -236,6 +241,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     ensure_turns_table(pg_dsn)
     logger.info("PostgreSQL pool and schema ready.")
 
+    memory_http_client = httpx.AsyncClient(base_url=settings.mcp_server_url, timeout=10)
+
     mcp_url = f"{settings.mcp_server_url}/mcp"
     logger.info(
         "Connecting to MCP server at %s (pool_size=%d)...",
@@ -248,6 +255,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         ServiceContainer.initialise(
             ollama_client=ollama_client,
             mcp_session_pool=pool,
+            memory_http_client=memory_http_client,
             pg_dsn=pg_dsn,
             mcp_tools=mcp_tools,
             function_calling_model=settings.server_function_calling_model,
@@ -259,6 +267,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         raise
     finally:
         await pool.stop()
+        await memory_http_client.aclose()
         ServiceContainer.reset()
         close_pool()
         logger.info("Server shut down.")
@@ -278,6 +287,13 @@ def get_mcp_session_pool() -> McpSessionPool:
     return container.mcp_session_pool
 
 
+def get_memory_http_client() -> httpx.AsyncClient:
+    container = ServiceContainer.get_or_none()
+    if container is None:
+        raise HTTPException(status_code=503, detail="services not initialised")
+    return container.memory_http_client
+
+
 def get_pg_dsn() -> str:
     container = ServiceContainer.get_or_none()
     if container is None:
@@ -285,23 +301,11 @@ def get_pg_dsn() -> str:
     return container.pg_dsn
 
 
-def _is_internal_tool(tool: Tool) -> bool:
-    """Return True if the tool is tagged as internal infrastructure.
-
-    Internal tools are called directly by the server and should never be
-    described to the model.  FastMCP encodes tags in tool.meta under the
-    key ``fastmcp.tags``; any tool carrying the ``"internal"`` tag is
-    excluded from the model-facing tool list.
-    """
-    tags = (tool.meta or {}).get("fastmcp", {}).get("tags", [])
-    return "internal" in tags
-
-
 def get_mcp_tools() -> list[Tool]:
     container = ServiceContainer.get_or_none()
     if container is None:
         return []
-    return [t for t in container.mcp_tools if not _is_internal_tool(t)]
+    return list(container.mcp_tools)
 
 
 def get_function_calling_model() -> str:
@@ -313,6 +317,7 @@ def get_function_calling_model() -> str:
 
 OllamaClientDep = Annotated[AsyncClient, Depends(get_ollama_client)]
 McpSessionPoolDep = Annotated[McpSessionPool, Depends(get_mcp_session_pool)]
+MemoryHttpClientDep = Annotated[httpx.AsyncClient, Depends(get_memory_http_client)]
 PgDsnDep = Annotated[str, Depends(get_pg_dsn)]
 McpToolsDep = Annotated[list[Tool], Depends(get_mcp_tools)]
 FunctionCallingModelDep = Annotated[str, Depends(get_function_calling_model)]

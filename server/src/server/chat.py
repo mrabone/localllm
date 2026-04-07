@@ -6,6 +6,7 @@ from enum import Enum
 from dataclasses import dataclass
 from typing import AsyncGenerator, Literal
 
+import httpx
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, StateGraph
 from langgraph.graph.state import CompiledStateGraph
@@ -17,10 +18,6 @@ from typing_extensions import TypedDict
 from server.config import settings
 
 logger = logging.getLogger(__name__)
-
-TOOL_LOAD_LONG_TERM_MEMORY = "load_long_term_memory"
-TOOL_LOAD_CONVERSATION_WINDOW = "load_conversation_window"
-TOOL_PERSIST_MESSAGE = "persist_message"
 
 
 class Role(Enum):
@@ -69,6 +66,7 @@ class GraphState(TypedDict):
     session_id: str
     user_input: str
     mcp_session: ClientSession
+    memory_http_client: httpx.AsyncClient
     ollama_client: AsyncClient
     chat_model: str
     function_calling_model: str
@@ -82,63 +80,64 @@ class GraphState(TypedDict):
 async def load_context_node(state: GraphState) -> dict:
     """Load memory, conversation window, and persist the user turn concurrently.
 
-    Issues three MCP calls in parallel to minimise pre-stream latency.  Failures
+    Issues three HTTP calls in parallel to minimise pre-stream latency.  Failures
     are logged and treated as empty results so the turn can continue.
     """
-    mcp_session = state["mcp_session"]
+    client = state["memory_http_client"]
     session_id = state["session_id"]
     user_input = state["user_input"]
 
-    async def _call_tool(name: str, arguments: dict) -> str:
-        result = await mcp_session.call_tool(name, arguments=arguments)
-        if result.content:
-            first = result.content[0]
-            return first.text if isinstance(first, TextContent) else ""
-        return ""
+    async def fetch_long_term_memory() -> str:
+        response = await client.get(
+            f"/memory/long-term/{session_id}",
+            params={"long_term_max": settings.server_memory_long_term_max},
+        )
+        response.raise_for_status()
+        return response.json().get("content", "")
 
-    gather_results = await asyncio.gather(
-        _call_tool(
-            TOOL_LOAD_LONG_TERM_MEMORY,
-            {
-                "session_id": session_id,
-                "long_term_max": settings.server_memory_long_term_max,
-            },
-        ),
-        _call_tool(
-            TOOL_LOAD_CONVERSATION_WINDOW,
-            {
-                "session_id": session_id,
-                "window_size": settings.server_memory_window_size,
-            },
-        ),
-        _call_tool(
-            TOOL_PERSIST_MESSAGE,
-            {
+    async def fetch_conversation_window() -> str:
+        response = await client.get(
+            f"/memory/window/{session_id}",
+            params={"window_size": settings.server_memory_window_size},
+        )
+        response.raise_for_status()
+        return response.text
+
+    async def persist_user_message() -> None:
+        response = await client.post(
+            "/memory/messages",
+            json={
                 "session_id": session_id,
                 "role": Role.USER.value,
                 "content": user_input,
             },
-        ),
+        )
+        response.raise_for_status()
+
+    gather_results = await asyncio.gather(
+        fetch_long_term_memory(),
+        fetch_conversation_window(),
+        persist_user_message(),
         return_exceptions=True,
     )
 
-    tool_names = [
-        TOOL_LOAD_LONG_TERM_MEMORY,
-        TOOL_LOAD_CONVERSATION_WINDOW,
-        TOOL_PERSIST_MESSAGE,
+    call_names = [
+        "load_long_term_memory",
+        "load_conversation_window",
+        "persist_message",
     ]
     resolved: list[str] = []
-    for name, result in zip(tool_names, gather_results):
+    for name, result in zip(call_names, gather_results):
         if isinstance(result, BaseException):
             logger.warning(
-                "MCP tool '%s' failed during context gather (session=%s): %s",
+                "Memory call '%s' failed during context gather (session=%s): %s",
                 name,
                 session_id,
                 result,
             )
             resolved.append("")
         else:
-            resolved.append(result)  # type: ignore[arg-type]
+            resolved.append(result or "")  # type: ignore[arg-type]
 
     long_term_content, window_content, _ = resolved
 
@@ -167,7 +166,7 @@ async def load_context_node(state: GraphState) -> dict:
             window_turns = json.loads(window_content)
             messages.extend(window_turns)
         except (json.JSONDecodeError, TypeError):
-            logger.warning("Could not parse window content from MCP tool.")
+            logger.warning("Could not parse window content from memory endpoint.")
 
     messages.append({"role": Role.USER.value, "content": user_input})
 
@@ -372,6 +371,7 @@ async def run_chat_graph(
     session_id: uuid.UUID,
     user_input: str,
     mcp_session: ClientSession,
+    memory_http_client: httpx.AsyncClient,
     ollama_client: AsyncClient,
     chat_model: str,
     function_calling_model: str,
@@ -384,12 +384,14 @@ async def run_chat_graph(
     the queue, yielding each token to the SSE endpoint as soon as Ollama produces
     it — without waiting for the full response to complete.
 
-    After the stream is exhausted the full assembled answer is persisted via MCP.
+    After the stream is exhausted the full assembled answer is persisted via the
+    memory HTTP endpoint.
     """
     initial_state: GraphState = {
         "session_id": str(session_id),
         "user_input": user_input,
         "mcp_session": mcp_session,
+        "memory_http_client": memory_http_client,
         "ollama_client": ollama_client,
         "chat_model": chat_model,
         "function_calling_model": function_calling_model,
@@ -428,14 +430,15 @@ async def run_chat_graph(
 
     if final_answer:
         try:
-            await mcp_session.call_tool(
-                TOOL_PERSIST_MESSAGE,
-                arguments={
+            response = await memory_http_client.post(
+                "/memory/messages",
+                json={
                     "session_id": str(session_id),
                     "role": Role.ASSISTANT.value,
                     "content": final_answer,
                 },
             )
+            response.raise_for_status()
         except Exception as exc:
             logger.error(
                 "Failed to persist assistant message (session=%s): %s",

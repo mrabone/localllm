@@ -10,14 +10,14 @@ from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
 from common.db_pool import is_pool_healthy
-from mcp.types import TextContent
-from server.chat import TOOL_LOAD_LONG_TERM_MEMORY, run_chat_graph
+from server.chat import run_chat_graph
 from server.config import settings
 from server.memory import create_session, session_exists
 from server.services import (
     FunctionCallingModelDep,
     McpSessionPoolDep,
     McpToolsDep,
+    MemoryHttpClientDep,
     OllamaClientDep,
     PgDsnDep,
     ServiceContainer,
@@ -68,19 +68,18 @@ def check_session_exists_endpoint(session_id: uuid.UUID, pg_dsn: PgDsnDep) -> No
 
 @app.get("/sessions/{session_id}", response_model=SessionHistoryResponse)
 async def get_session_history(
-    session_id: uuid.UUID, pg_dsn: PgDsnDep, mcp_pool: McpSessionPoolDep
+    session_id: uuid.UUID,
+    pg_dsn: PgDsnDep,
+    memory_http_client: MemoryHttpClientDep,
 ) -> SessionHistoryResponse:
     """Return the stored memories for an existing session."""
     exists = await asyncio.to_thread(session_exists, pg_dsn, session_id)
     if not exists:
         raise HTTPException(status_code=404, detail="Session not found.")
 
-    async with mcp_pool.acquire() as mcp_session:
-        memories_result = await mcp_session.call_tool(
-            TOOL_LOAD_LONG_TERM_MEMORY, arguments={"session_id": str(session_id)}
-        )
-    first_memory = memories_result.content[0] if memories_result.content else None
-    memories_text = first_memory.text if isinstance(first_memory, TextContent) else ""
+    response = await memory_http_client.get(f"/memory/long-term/{session_id}")
+    response.raise_for_status()
+    memories_text = response.json().get("content", "")
     messages = (
         [MessageResponse(role="system", content=memories_text)] if memories_text else []
     )
@@ -93,6 +92,7 @@ async def chat(
     body: ChatRequest,
     pg_dsn: PgDsnDep,
     mcp_pool: McpSessionPoolDep,
+    memory_http_client: MemoryHttpClientDep,
     ollama_client: OllamaClientDep,
     mcp_tools: McpToolsDep,
     function_calling_model: FunctionCallingModelDep,
@@ -119,6 +119,7 @@ async def chat(
                     session_id=session_id,
                     user_input=body.message,
                     mcp_session=mcp_session,
+                    memory_http_client=memory_http_client,
                     ollama_client=ollama_client,
                     chat_model=settings.server_ollama_model,
                     function_calling_model=function_calling_model,

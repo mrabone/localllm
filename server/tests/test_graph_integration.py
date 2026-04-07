@@ -2,11 +2,24 @@ import json
 import uuid
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
+import pytest_asyncio
 from mcp.types import TextContent, Tool
 
 from server.chat import Role, run_chat_graph
-from server.services import _is_internal_tool
+
+_open_clients: list[httpx.AsyncClient] = []
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def close_memory_clients():
+    """Close any httpx.AsyncClient instances registered via _make_memory_client
+    or created inline in tests, to prevent resource-leak warnings."""
+    yield
+    for client in _open_clients:
+        await client.aclose()
+    _open_clients.clear()
 
 
 def _make_mcp_tool(
@@ -51,8 +64,12 @@ def _make_stream_response(tokens: list[str]):
     return _gen()
 
 
-def _stub_call_tool(tool_responses: dict):
-    """Return an AsyncMock for call_tool that dispatches by tool name."""
+def _stub_mcp_call_tool(tool_responses: dict):
+    """Return an AsyncMock for MCP call_tool that dispatches by tool name.
+
+    Only used for model-callable tools (e.g. search_knowledge_base) — the
+    three infrastructure calls now go through the memory HTTP endpoints.
+    """
 
     async def _call_tool(name, *, arguments=None, **kwargs):
         text = tool_responses.get(name, "")
@@ -76,26 +93,60 @@ def _make_fc_tool_call(name: str, arguments: dict | None = None):
     return tc
 
 
+def _make_memory_client(
+    long_term_content: str = "",
+    window_turns: list | None = None,
+) -> httpx.AsyncClient:
+    """Return a real httpx.AsyncClient backed by a mock transport.
+
+    Stubs the three memory REST endpoints so tests don't need a live server.
+    The client is registered for automatic cleanup by the close_memory_clients fixture.
+    """
+
+    async def _transport(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if "/memory/long-term/" in path:
+            return httpx.Response(200, json={"content": long_term_content})
+        if "/memory/window/" in path:
+            return httpx.Response(200, json=window_turns or [])
+        if path == "/memory/messages":
+            return httpx.Response(204)
+        return httpx.Response(404)
+
+    transport = httpx.MockTransport(_transport)
+    client = httpx.AsyncClient(base_url="http://mcp-test", transport=transport)
+    _open_clients.append(client)
+    return client
+
+
 async def _run_graph(
     user_input: str = "hello",
     mcp_tools: list | None = None,
     mcp_session=None,
+    memory_http_client=None,
     ollama_client=None,
     session_id=None,
+    long_term_content: str = "",
+    window_turns: list | None = None,
 ):
     """Run run_chat_graph with sensible defaults and collect all tokens."""
     if mcp_session is None:
         mcp_session = AsyncMock()
-        mcp_session.call_tool = _stub_call_tool({})
+        mcp_session.call_tool = _stub_mcp_call_tool({})
+    if memory_http_client is None:
+        memory_http_client = _make_memory_client(
+            long_term_content=long_term_content,
+            window_turns=window_turns,
+        )
     if ollama_client is None:
         ollama_client = AsyncMock()
         ollama_client.chat = AsyncMock(return_value=_make_stream_response(["ok"]))
 
-    # run_chat_graph is now an async generator, so don't await it
     stream = run_chat_graph(
         session_id=session_id or uuid.uuid4(),
         user_input=user_input,
         mcp_session=mcp_session,
+        memory_http_client=memory_http_client,
         ollama_client=ollama_client,
         chat_model="test-chat",
         function_calling_model="test-fc",
@@ -107,42 +158,45 @@ async def _run_graph(
 @pytest.mark.asyncio
 class TestTokenStreaming:
     async def test_tokens_yielded_in_order(self):
-        mcp_session = AsyncMock()
-        mcp_session.call_tool = _stub_call_tool({})
-
         ollama_client = AsyncMock()
         ollama_client.chat = AsyncMock(
             return_value=_make_stream_response(["Hello", " world"])
         )
 
-        tokens = await _run_graph(
-            mcp_session=mcp_session,
-            ollama_client=ollama_client,
-        )
+        tokens = await _run_graph(ollama_client=ollama_client)
 
         assert "".join(tokens) == "Hello world"
 
-    async def test_infrastructure_tools_always_called(self):
-        """load_long_term_memory, load_conversation_window, and persist_message
-        are always invoked regardless of whether mcp_tools is empty."""
-        mcp_session = AsyncMock()
-        call_tool_mock = _stub_call_tool({})
-        mcp_session.call_tool = call_tool_mock
+    async def test_memory_endpoints_always_called(self):
+        """All three memory endpoints are called on every turn regardless of mcp_tools."""
+        calls: list[str] = []
 
-        ollama_client = AsyncMock()
-        ollama_client.chat = AsyncMock(return_value=_make_stream_response(["ok"]))
+        async def _transport(request: httpx.Request) -> httpx.Response:
+            calls.append(request.url.path)
+            if "/memory/long-term/" in request.url.path:
+                return httpx.Response(200, json={"content": ""})
+            if "/memory/window/" in request.url.path:
+                return httpx.Response(200, json=[])
+            if request.url.path == "/memory/messages":
+                return httpx.Response(204)
+            return httpx.Response(404)
 
-        await _run_graph(mcp_session=mcp_session, ollama_client=ollama_client)
+        client = httpx.AsyncClient(
+            base_url="http://mcp-test",
+            transport=httpx.MockTransport(_transport),
+        )
+        _open_clients.append(client)
 
-        called_names = {c.args[0] for c in call_tool_mock.await_args_list}
-        assert "load_long_term_memory" in called_names
-        assert "load_conversation_window" in called_names
-        assert "persist_message" in called_names
+        await _run_graph(memory_http_client=client)
+
+        assert any("/memory/long-term/" in p for p in calls)
+        assert any("/memory/window/" in p for p in calls)
+        assert "/memory/messages" in calls
 
     async def test_search_kb_not_called_when_no_tools(self):
         """search_knowledge_base must never be called unless the FC model requests it."""
         mcp_session = AsyncMock()
-        call_tool_mock = _stub_call_tool({})
+        call_tool_mock = _stub_mcp_call_tool({})
         mcp_session.call_tool = call_tool_mock
 
         ollama_client = AsyncMock()
@@ -154,119 +208,96 @@ class TestTokenStreaming:
         assert "search_knowledge_base" not in called_names
 
     async def test_tokens_streamed_incrementally_not_buffered(self):
-        """Tokens should be yielded as they arrive, not buffered until completion.
-
-        This test verifies the fix for the streaming regression: with astream()
-        the graph yields partial results during streaming (no TTFB delay).
-        """
-        mcp_session = AsyncMock()
-        mcp_session.call_tool = _stub_call_tool({})
-
+        """Tokens should be yielded as they arrive, not buffered until completion."""
         ollama_client = AsyncMock()
-        # Simulate Ollama streaming 3 tokens incrementally
         ollama_client.chat = AsyncMock(
             return_value=_make_stream_response(["Hello", " ", "world"])
         )
 
-        tokens = await _run_graph(mcp_session=mcp_session, ollama_client=ollama_client)
+        tokens = await _run_graph(ollama_client=ollama_client)
 
-        # Verify tokens are yielded in order and can be consumed incrementally
         assert len(tokens) > 0, "should have streamed at least one token"
         assert "".join(tokens) == "Hello world"
 
     async def test_long_response_does_not_buffer_excessively(self):
-        """Large responses should not cause excessive memory usage during streaming.
-
-        With astream() each token update is yielded immediately rather than
-        accumulating all tokens before returning.
-        """
-        mcp_session = AsyncMock()
-        mcp_session.call_tool = _stub_call_tool({})
-
-        # Simulate a large response with many small tokens
+        """Large responses should not cause excessive memory usage during streaming."""
         large_response_tokens = ["word"] * 1000
         ollama_client = AsyncMock()
         ollama_client.chat = AsyncMock(
             return_value=_make_stream_response(large_response_tokens)
         )
 
-        tokens = await _run_graph(mcp_session=mcp_session, ollama_client=ollama_client)
+        tokens = await _run_graph(ollama_client=ollama_client)
 
-        # Verify all tokens were streamed
         assert len(tokens) > 0
         assert "".join(tokens) == "word" * 1000
 
     async def test_assistant_message_persisted_with_full_response(self):
         """After streaming completes, the full assembled response is persisted."""
-        mcp_session = AsyncMock()
-        call_tool_mock = _stub_call_tool({})
-        mcp_session.call_tool = call_tool_mock
+        persisted: list[dict] = []
 
+        async def _transport(request: httpx.Request) -> httpx.Response:
+            if "/memory/long-term/" in request.url.path:
+                return httpx.Response(200, json={"content": ""})
+            if "/memory/window/" in request.url.path:
+                return httpx.Response(200, json=[])
+            if request.url.path == "/memory/messages":
+                persisted.append(request.read())
+                return httpx.Response(204)
+            return httpx.Response(404)
+
+        client = httpx.AsyncClient(
+            base_url="http://mcp-test",
+            transport=httpx.MockTransport(_transport),
+        )
+        _open_clients.append(client)
         ollama_client = AsyncMock()
         ollama_client.chat = AsyncMock(
             return_value=_make_stream_response(["Complete", " response"])
         )
 
-        session_id = uuid.uuid4()
-        await _run_graph(
-            mcp_session=mcp_session,
-            ollama_client=ollama_client,
-            session_id=session_id,
-        )
+        await _run_graph(memory_http_client=client, ollama_client=ollama_client)
 
-        # Find the persist_message call for the assistant turn (last one should be)
-        persist_calls = [
-            c for c in call_tool_mock.await_args_list if c[0][0] == "persist_message"
-        ]
+        assert len(persisted) >= 2, "should have persisted user and assistant turns"
 
-        assert len(persist_calls) >= 2, "should have persisted user and assistant turns"
-
-        # The last persist_message call should be the assistant response
-        last_persist = persist_calls[-1]
-        assert last_persist[1]["arguments"]["role"] == "assistant"
-        # Should contain the full streamed response
-        assert last_persist[1]["arguments"]["content"] == "Complete response"
+        last_body = json.loads(persisted[-1])
+        assert last_body["role"] == "assistant"
+        assert last_body["content"] == "Complete response"
 
 
 @pytest.mark.asyncio
 class TestContextMessageOrder:
-    async def _capture_generate_messages(self, mcp_session, ollama_client):
+    async def _capture_generate_messages(self, ollama_client, **kwargs):
         """Return the messages passed to the final generate_response Ollama call."""
-        await _run_graph(mcp_session=mcp_session, ollama_client=ollama_client)
+        await _run_graph(ollama_client=ollama_client, **kwargs)
         return ollama_client.chat.call_args[1]["messages"]
 
     async def test_orientation_is_always_first(self):
-        mcp_session = AsyncMock()
-        mcp_session.call_tool = _stub_call_tool({})
         ollama_client = AsyncMock()
         ollama_client.chat = AsyncMock(return_value=_make_stream_response(["ok"]))
 
-        messages = await self._capture_generate_messages(mcp_session, ollama_client)
+        messages = await self._capture_generate_messages(ollama_client)
 
         assert messages[0]["role"] == "system"
         assert "helpful assistant" in messages[0]["content"]
 
     async def test_no_extra_messages_when_context_empty(self):
-        mcp_session = AsyncMock()
-        mcp_session.call_tool = _stub_call_tool({})
         ollama_client = AsyncMock()
         ollama_client.chat = AsyncMock(return_value=_make_stream_response(["ok"]))
 
-        messages = await self._capture_generate_messages(mcp_session, ollama_client)
+        messages = await self._capture_generate_messages(ollama_client)
 
         assert len(messages) == 2
         assert messages[0]["role"] == "system"
         assert messages[1] == {"role": "user", "content": "hello"}
 
     async def test_long_term_memory_after_orientation(self):
-        mcp_session = AsyncMock()
-        mcp_session.call_tool = _stub_call_tool(
-            {"load_long_term_memory": "User likes Python"}
-        )
         ollama_client = AsyncMock()
         ollama_client.chat = AsyncMock(return_value=_make_stream_response(["ok"]))
 
-        messages = await self._capture_generate_messages(mcp_session, ollama_client)
+        messages = await self._capture_generate_messages(
+            ollama_client, long_term_content="User likes Python"
+        )
 
         assert messages[1] == {"role": "system", "content": "User likes Python"}
 
@@ -275,32 +306,23 @@ class TestContextMessageOrder:
             {"role": "user", "content": "prev q"},
             {"role": "assistant", "content": "prev a"},
         ]
-        mcp_session = AsyncMock()
-        mcp_session.call_tool = _stub_call_tool(
-            {
-                "load_long_term_memory": "some memory",
-                "load_conversation_window": json.dumps(window_turns),
-            }
-        )
         ollama_client = AsyncMock()
         ollama_client.chat = AsyncMock(return_value=_make_stream_response(["ok"]))
 
-        messages = await self._capture_generate_messages(mcp_session, ollama_client)
+        messages = await self._capture_generate_messages(
+            ollama_client,
+            long_term_content="some memory",
+            window_turns=window_turns,
+        )
 
         assert messages[2] == {"role": "user", "content": "prev q"}
         assert messages[3] == {"role": "assistant", "content": "prev a"}
 
     async def test_user_turn_is_last(self):
-        mcp_session = AsyncMock()
-        mcp_session.call_tool = _stub_call_tool({})
         ollama_client = AsyncMock()
         ollama_client.chat = AsyncMock(return_value=_make_stream_response(["ok"]))
 
-        await _run_graph(
-            user_input="my question",
-            mcp_session=mcp_session,
-            ollama_client=ollama_client,
-        )
+        await _run_graph(user_input="my question", ollama_client=ollama_client)
 
         messages = ollama_client.chat.call_args[1]["messages"]
         assert messages[-1] == {"role": "user", "content": "my question"}
@@ -310,20 +332,14 @@ class TestContextMessageOrder:
             {"role": "user", "content": "prev q"},
             {"role": "assistant", "content": "prev a"},
         ]
-        mcp_session = AsyncMock()
-        mcp_session.call_tool = _stub_call_tool(
-            {
-                "load_long_term_memory": "memory facts",
-                "load_conversation_window": json.dumps(window_turns),
-            }
-        )
         ollama_client = AsyncMock()
         ollama_client.chat = AsyncMock(return_value=_make_stream_response(["ok"]))
 
         await _run_graph(
             user_input="current q",
-            mcp_session=mcp_session,
             ollama_client=ollama_client,
+            long_term_content="memory facts",
+            window_turns=window_turns,
         )
 
         messages = ollama_client.chat.call_args[1]["messages"]
@@ -339,70 +355,95 @@ class TestContextMessageOrder:
 @pytest.mark.asyncio
 class TestPersistMessages:
     async def test_user_message_persisted_before_stream(self):
-        mcp_session = AsyncMock()
-        call_tool_mock = _stub_call_tool({})
-        mcp_session.call_tool = call_tool_mock
+        persisted: list[dict] = []
 
+        async def _transport(request: httpx.Request) -> httpx.Response:
+            if "/memory/long-term/" in request.url.path:
+                return httpx.Response(200, json={"content": ""})
+            if "/memory/window/" in request.url.path:
+                return httpx.Response(200, json=[])
+            if request.url.path == "/memory/messages":
+                persisted.append(json.loads(request.read()))
+                return httpx.Response(204)
+            return httpx.Response(404)
+
+        client = httpx.AsyncClient(
+            base_url="http://mcp-test",
+            transport=httpx.MockTransport(_transport),
+        )
+        _open_clients.append(client)
         ollama_client = AsyncMock()
         ollama_client.chat = AsyncMock(return_value=_make_stream_response(["ok"]))
 
         await _run_graph(
             user_input="user input",
-            mcp_session=mcp_session,
+            memory_http_client=client,
             ollama_client=ollama_client,
         )
 
-        persist_calls = [
-            c for c in call_tool_mock.await_args_list if c.args[0] == "persist_message"
-        ]
-        user_persist = next(
-            (c for c in persist_calls if c.kwargs["arguments"]["role"] == "user"),
-            None,
-        )
+        user_persist = next((p for p in persisted if p.get("role") == "user"), None)
         assert user_persist is not None
-        assert user_persist.kwargs["arguments"]["content"] == "user input"
+        assert user_persist["content"] == "user input"
 
     async def test_assistant_message_persisted_after_stream(self):
-        mcp_session = AsyncMock()
-        call_tool_mock = _stub_call_tool({})
-        mcp_session.call_tool = call_tool_mock
+        persisted: list[dict] = []
 
+        async def _transport(request: httpx.Request) -> httpx.Response:
+            if "/memory/long-term/" in request.url.path:
+                return httpx.Response(200, json={"content": ""})
+            if "/memory/window/" in request.url.path:
+                return httpx.Response(200, json=[])
+            if request.url.path == "/memory/messages":
+                persisted.append(json.loads(request.read()))
+                return httpx.Response(204)
+            return httpx.Response(404)
+
+        client = httpx.AsyncClient(
+            base_url="http://mcp-test",
+            transport=httpx.MockTransport(_transport),
+        )
+        _open_clients.append(client)
         ollama_client = AsyncMock()
         ollama_client.chat = AsyncMock(
             return_value=_make_stream_response(["Hello", " there"])
         )
 
-        await _run_graph(mcp_session=mcp_session, ollama_client=ollama_client)
+        await _run_graph(memory_http_client=client, ollama_client=ollama_client)
 
-        persist_calls = [
-            c for c in call_tool_mock.await_args_list if c.args[0] == "persist_message"
-        ]
         assistant_persist = next(
-            (c for c in persist_calls if c.kwargs["arguments"]["role"] == "assistant"),
-            None,
+            (p for p in persisted if p.get("role") == "assistant"), None
         )
         assert assistant_persist is not None
-        assert assistant_persist.kwargs["arguments"]["content"] == "Hello there"
+        assert assistant_persist["content"] == "Hello there"
 
     async def test_persist_failure_does_not_raise(self):
-        """An error persisting the assistant message must not propagate to the caller."""
-        mcp_session = AsyncMock()
+        """An HTTP error persisting the assistant message must not propagate."""
+        call_count = 0
 
-        async def _failing_persist(name, *, arguments=None, **kwargs):
-            if (
-                name == "persist_message"
-                and arguments
-                and arguments.get("role") == "assistant"
-            ):
-                raise RuntimeError("db down")
-            return _make_empty_tool_result()
+        async def _transport(request: httpx.Request) -> httpx.Response:
+            nonlocal call_count
+            if "/memory/long-term/" in request.url.path:
+                return httpx.Response(200, json={"content": ""})
+            if "/memory/window/" in request.url.path:
+                return httpx.Response(200, json=[])
+            if request.url.path == "/memory/messages":
+                call_count += 1
+                if call_count == 1:
+                    return httpx.Response(204)
+                return httpx.Response(500)
+            return httpx.Response(404)
 
-        mcp_session.call_tool = AsyncMock(side_effect=_failing_persist)
-
+        client = httpx.AsyncClient(
+            base_url="http://mcp-test",
+            transport=httpx.MockTransport(_transport),
+        )
+        _open_clients.append(client)
         ollama_client = AsyncMock()
         ollama_client.chat = AsyncMock(return_value=_make_stream_response(["ok"]))
 
-        tokens = await _run_graph(mcp_session=mcp_session, ollama_client=ollama_client)
+        tokens = await _run_graph(
+            memory_http_client=client, ollama_client=ollama_client
+        )
         assert "".join(tokens) == "ok"
 
 
@@ -410,17 +451,10 @@ class TestPersistMessages:
 class TestToolCallingLoop:
     async def test_no_fc_call_when_mcp_tools_empty(self):
         """With no mcp_tools the FC model is never called; only the chat model streams."""
-        mcp_session = AsyncMock()
-        mcp_session.call_tool = _stub_call_tool({})
-
         ollama_client = AsyncMock()
         ollama_client.chat = AsyncMock(return_value=_make_stream_response(["answer"]))
 
-        await _run_graph(
-            mcp_tools=[],
-            mcp_session=mcp_session,
-            ollama_client=ollama_client,
-        )
+        await _run_graph(mcp_tools=[], ollama_client=ollama_client)
 
         call_kwargs_list = [c[1] for c in ollama_client.chat.call_args_list]
         fc_calls = [k for k in call_kwargs_list if k.get("stream") is False]
@@ -430,7 +464,7 @@ class TestToolCallingLoop:
         """When the FC model responds with no tool calls, the text is streamed as-is."""
         tool = _make_mcp_tool("search_kb", "Search")
         mcp_session = AsyncMock()
-        mcp_session.call_tool = _stub_call_tool({})
+        mcp_session.call_tool = _stub_mcp_call_tool({})
 
         call_count = 0
 
@@ -497,7 +531,7 @@ class TestToolCallingLoop:
         """The tool-calling loop terminates after server_tool_call_max_loops iterations."""
         tool = _make_mcp_tool("looping_tool")
         mcp_session = AsyncMock()
-        mcp_session.call_tool = _stub_call_tool({"looping_tool": "some result"})
+        mcp_session.call_tool = _stub_mcp_call_tool({"looping_tool": "some result"})
 
         fc_call_count = 0
 
@@ -527,7 +561,7 @@ class TestToolCallingLoop:
         """Calling a non-existent tool produces an error result visible to the LLM."""
         tool = _make_mcp_tool("real_tool")
         mcp_session = AsyncMock()
-        mcp_session.call_tool = _stub_call_tool({})
+        mcp_session.call_tool = _stub_mcp_call_tool({})
 
         fc_call_count = 0
 
@@ -638,37 +672,3 @@ class TestToolCallingLoop:
             m for m in generate_call_messages if m.get("role") == Role.TOOL.value
         ]
         assert any("No results found" in m["content"] for m in tool_msgs)
-
-
-class TestInternalToolFiltering:
-    def _make_tool_with_meta(self, name: str, tags: list[str]) -> MagicMock:
-        tool = MagicMock()
-        tool.name = name
-        tool.meta = {"fastmcp": {"tags": tags}}
-        return tool
-
-    def _make_tool_no_meta(self, name: str) -> MagicMock:
-        tool = MagicMock()
-        tool.name = name
-        tool.meta = None
-        return tool
-
-    def test_tool_tagged_internal_is_filtered(self):
-        tool = self._make_tool_with_meta("load_long_term_memory", ["internal"])
-        assert _is_internal_tool(tool) is True
-
-    def test_tool_tagged_internal_among_others_is_filtered(self):
-        tool = self._make_tool_with_meta("persist_message", ["internal", "other"])
-        assert _is_internal_tool(tool) is True
-
-    def test_tool_with_no_tags_is_not_filtered(self):
-        tool = self._make_tool_with_meta("search_knowledge_base", [])
-        assert _is_internal_tool(tool) is False
-
-    def test_tool_with_no_meta_is_not_filtered(self):
-        tool = self._make_tool_no_meta("search_knowledge_base")
-        assert _is_internal_tool(tool) is False
-
-    def test_tool_with_unrelated_tag_is_not_filtered(self):
-        tool = self._make_tool_with_meta("some_public_tool", ["readonly"])
-        assert _is_internal_tool(tool) is False
