@@ -407,14 +407,16 @@ async def run_chat_graph(
         _chat_graph.ainvoke(initial_state, config=run_config)
     )
 
+    drain_completed = False
     try:
         while True:
             token = await token_queue.get()
             if token is None:
+                drain_completed = True
                 break
             yield token
     finally:
-        if not graph_task.done():
+        if not drain_completed and not graph_task.done():
             graph_task.cancel()
             try:
                 await graph_task
