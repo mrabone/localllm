@@ -1,8 +1,10 @@
+import asyncio
 import json
 import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from langchain_core.runnables import RunnableConfig
 from mcp.types import TextContent, Tool
 
 from server.chat import (
@@ -16,6 +18,13 @@ from server.chat import (
     load_context_node,
     mcp_tools_to_ollama_schemas,
 )
+
+
+def _make_node_config() -> tuple[RunnableConfig, asyncio.Queue]:
+    """Return a RunnableConfig with a token_queue, plus the queue itself."""
+    token_queue: asyncio.Queue = asyncio.Queue()
+    config: RunnableConfig = {"configurable": {"token_queue": token_queue}}
+    return config, token_queue
 
 
 def _make_mcp_tool(
@@ -567,7 +576,8 @@ class TestGenerateResponseNode:
             return_value=_make_stream_response(["Hello", " world"])
         )
 
-        result = await generate_response_node(state)
+        config, _ = _make_node_config()
+        result = await generate_response_node(state, config)
         assert result["resolved_answer"] == "Hello world"
 
     async def test_tool_result_messages_included_in_llm_call(self):
@@ -579,7 +589,8 @@ class TestGenerateResponseNode:
         ollama_mock = AsyncMock(return_value=_make_stream_response(["ok"]))
         state["ollama_client"].chat = ollama_mock
 
-        await generate_response_node(state)
+        config, _ = _make_node_config()
+        await generate_response_node(state, config)
 
         messages_passed = ollama_mock.call_args[1]["messages"]
         assert tool_result in messages_passed
@@ -594,7 +605,8 @@ class TestGenerateResponseNode:
         ollama_mock = AsyncMock(return_value=_make_stream_response(["ok"]))
         state["ollama_client"].chat = ollama_mock
 
-        await generate_response_node(state)
+        config, _ = _make_node_config()
+        await generate_response_node(state, config)
 
         messages_passed = ollama_mock.call_args[1]["messages"]
         assert pending_entry not in messages_passed
@@ -616,7 +628,8 @@ class TestGenerateResponseNode:
         call_tool_mock = AsyncMock(return_value=_make_empty_tool_result())
         state["mcp_session"].call_tool = call_tool_mock
 
-        result = await generate_response_node(state)
+        config, _ = _make_node_config()
+        result = await generate_response_node(state, config)
 
         # generate_response_node should return the assembled answer
         assert result["resolved_answer"] == "Hello there"
@@ -643,7 +656,8 @@ class TestGenerateResponseNode:
 
         state["mcp_session"].call_tool = AsyncMock(side_effect=_failing_persist)
 
-        result = await generate_response_node(state)
+        config, _ = _make_node_config()
+        result = await generate_response_node(state, config)
         assert result["resolved_answer"] == "ok"
 
     async def test_num_ctx_passed_to_ollama(self):
@@ -655,7 +669,8 @@ class TestGenerateResponseNode:
 
         with patch("server.chat.settings") as mock_settings:
             mock_settings.server_ollama_num_ctx = 4096
-            await generate_response_node(state)
+            config, _ = _make_node_config()
+            await generate_response_node(state, config)
 
         call_kwargs = ollama_mock.call_args[1]
         assert call_kwargs["options"]["num_ctx"] == 4096
