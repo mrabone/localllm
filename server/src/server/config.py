@@ -35,7 +35,26 @@ class Settings(SharedSettings):
     server_ollama_num_ctx: int = Field(
         default=8192,
         alias="SERVER_OLLAMA_NUM_CTX",
-        description="Context window size passed to Ollama on every chat call.",
+        description="Context window size passed to Ollama for the main chat model.",
+    )
+    server_function_calling_num_ctx: int = Field(
+        default=2048,
+        alias="SERVER_FUNCTION_CALLING_NUM_CTX",
+        description=(
+            "Context window size passed to the function-calling model (FunctionGemma). "
+            "Kept smaller than the main context since this model only needs to decide "
+            "which tools to call, not generate a full response."
+        ),
+    )
+
+    server_mcp_pool_size: int = Field(
+        default=4,
+        alias="SERVER_MCP_POOL_SIZE",
+        description=(
+            "Number of concurrent MCP client sessions to open at startup. "
+            "Each session uses its own HTTP connection, allowing concurrent "
+            "requests to avoid serialising their MCP tool calls."
+        ),
     )
 
     # Memory retrieval

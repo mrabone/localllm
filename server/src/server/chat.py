@@ -6,6 +6,7 @@ from enum import Enum
 from dataclasses import dataclass
 from typing import AsyncGenerator, Literal
 
+from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from mcp import ClientSession
@@ -194,7 +195,7 @@ async def decide_tools_node(state: GraphState) -> dict:
         messages=messages,
         tools=ollama_schemas,
         stream=False,
-        options={"num_ctx": settings.server_ollama_num_ctx},
+        options={"num_ctx": settings.server_function_calling_num_ctx},
     )
 
     raw_tool_calls = response.message.tool_calls or []
@@ -292,17 +293,21 @@ async def execute_tools_node(state: GraphState) -> dict:
     }
 
 
-async def generate_response_node(state: GraphState) -> dict:
+async def generate_response_node(state: GraphState, config: RunnableConfig) -> dict:
     """Stream the final response from the chat model.
 
     Combines the base messages with any accumulated tool result messages before
-    calling the chat model. Streams tokens directly from Ollama without buffering.
+    calling the chat model.  Pushes each token into the asyncio.Queue stored in
+    the LangGraph run config so that run_chat_graph can yield tokens to the SSE
+    endpoint as they arrive — without waiting for the full response to complete.
 
     Note: Persistence of the assistant message happens in run_chat_graph after
     all tokens have been collected, ensuring the full message is available.
     """
     client = state["ollama_client"]
     model = state["chat_model"]
+    configurable: dict = config.get("configurable") or {}  # type: ignore[assignment]
+    token_queue: asyncio.Queue[str | None] = configurable["token_queue"]
 
     tool_result_messages = [r for r in state["tool_results"] if "_pending" not in r]
     messages = state["messages"] + tool_result_messages
@@ -316,8 +321,11 @@ async def generate_response_node(state: GraphState) -> dict:
     )
     async for chunk in stream:
         token = chunk.message.content or ""
-        assembled_tokens.append(token)
+        if token:
+            assembled_tokens.append(token)
+            await token_queue.put(token)
 
+    await token_queue.put(None)
     assembled = "".join(assembled_tokens)
     return {"resolved_answer": assembled}
 
@@ -367,13 +375,14 @@ async def run_chat_graph(
     function_calling_model: str,
     mcp_tools: list[Tool],
 ) -> AsyncGenerator[str, None]:
-    """Run one chat turn through the LangGraph graph and stream tokens incrementally.
+    """Run one chat turn through the LangGraph graph and stream tokens in real time.
 
-    Uses LangGraph's `astream()` API to emit tokens as the chat model generates them,
-    rather than buffering until completion. After streaming is complete, persists
-    the full assembled answer via MCP.
+    Creates an asyncio.Queue shared with generate_response_node via the LangGraph
+    run config.  The graph runs as a background task while this generator drains
+    the queue, yielding each token to the SSE endpoint as soon as Ollama produces
+    it — without waiting for the full response to complete.
 
-    Yields token strings character-by-character as they become available.
+    After the stream is exhausted the full assembled answer is persisted via MCP.
     """
     initial_state: GraphState = {
         "session_id": str(session_id),
@@ -389,33 +398,26 @@ async def run_chat_graph(
         "resolved_answer": None,
     }
 
-    last_answer = ""
-    final_answer = None
+    token_queue: asyncio.Queue[str | None] = asyncio.Queue()
+    run_config: RunnableConfig = {"configurable": {"token_queue": token_queue}}
 
-    async for state in _chat_graph.astream(initial_state, stream_mode="values"):
-        answer = state.get("resolved_answer")
-        if answer is None:
-            continue
+    graph_task = asyncio.create_task(
+        _chat_graph.ainvoke(initial_state, config=run_config)
+    )
 
-        # Convert to string if needed
-        if not isinstance(answer, str):
-            continue
+    try:
+        while True:
+            token = await token_queue.get()
+            if token is None:
+                break
+            yield token
+    except Exception:
+        graph_task.cancel()
+        raise
 
-        # Emit incremental updates: new text since last emission
-        if answer.startswith(last_answer):
-            new_text = answer[len(last_answer) :]
-        else:
-            # Fallback if the answer was modified non-monotonically (shouldn't happen)
-            new_text = answer
+    final_state = await graph_task
+    final_answer = final_state.get("resolved_answer") if final_state else None
 
-        if new_text:
-            for char in new_text:
-                yield char
-
-        last_answer = answer
-        final_answer = answer
-
-    # Persist the complete assistant message after streaming finishes
     if final_answer:
         try:
             await mcp_session.call_tool(

@@ -17,14 +17,6 @@ services:
       timeout: 10s
       retries: 10
       start_period: 30s
-    deploy:
-      resources:
-        limits:
-          cpus: '6'
-          memory: 16G
-        reservations:
-          cpus: '2'
-          memory: 4G
     entrypoint: /bin/sh
     command:
       - -c
