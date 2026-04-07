@@ -16,7 +16,7 @@ from server.config import settings
 from server.memory import create_session, session_exists
 from server.services import (
     FunctionCallingModelDep,
-    McpSessionDep,
+    McpSessionPoolDep,
     McpToolsDep,
     OllamaClientDep,
     PgDsnDep,
@@ -68,16 +68,17 @@ def check_session_exists_endpoint(session_id: uuid.UUID, pg_dsn: PgDsnDep) -> No
 
 @app.get("/sessions/{session_id}", response_model=SessionHistoryResponse)
 async def get_session_history(
-    session_id: uuid.UUID, pg_dsn: PgDsnDep, mcp_session: McpSessionDep
+    session_id: uuid.UUID, pg_dsn: PgDsnDep, mcp_pool: McpSessionPoolDep
 ) -> SessionHistoryResponse:
     """Return the stored memories for an existing session."""
     exists = await asyncio.to_thread(session_exists, pg_dsn, session_id)
     if not exists:
         raise HTTPException(status_code=404, detail="Session not found.")
 
-    memories_result = await mcp_session.call_tool(
-        TOOL_LOAD_LONG_TERM_MEMORY, arguments={"session_id": str(session_id)}
-    )
+    async with mcp_pool.acquire() as mcp_session:
+        memories_result = await mcp_session.call_tool(
+            TOOL_LOAD_LONG_TERM_MEMORY, arguments={"session_id": str(session_id)}
+        )
     first_memory = memories_result.content[0] if memories_result.content else None
     memories_text = first_memory.text if isinstance(first_memory, TextContent) else ""
     messages = (
@@ -91,7 +92,7 @@ async def chat(
     session_id: uuid.UUID,
     body: ChatRequest,
     pg_dsn: PgDsnDep,
-    mcp_session: McpSessionDep,
+    mcp_pool: McpSessionPoolDep,
     ollama_client: OllamaClientDep,
     mcp_tools: McpToolsDep,
     function_calling_model: FunctionCallingModelDep,
@@ -100,7 +101,8 @@ async def chat(
 
     The session existence check happens before the EventSourceResponse is
     created so that a missing session returns a proper HTTP 404 rather than
-    an SSE error event.
+    an SSE error event.  An MCP session is checked out from the pool for the
+    duration of the request and returned when the stream completes.
 
     Events:
       - ``token``  — one text fragment from the model.
@@ -112,18 +114,19 @@ async def chat(
 
     async def event_generator() -> AsyncGenerator[dict, None]:
         try:
-            token_stream = run_chat_graph(
-                session_id=session_id,
-                user_input=body.message,
-                mcp_session=mcp_session,
-                ollama_client=ollama_client,
-                chat_model=settings.server_ollama_model,
-                function_calling_model=function_calling_model,
-                mcp_tools=mcp_tools,
-            )
+            async with mcp_pool.acquire() as mcp_session:
+                token_stream = run_chat_graph(
+                    session_id=session_id,
+                    user_input=body.message,
+                    mcp_session=mcp_session,
+                    ollama_client=ollama_client,
+                    chat_model=settings.server_ollama_model,
+                    function_calling_model=function_calling_model,
+                    mcp_tools=mcp_tools,
+                )
 
-            async for token in token_stream:
-                yield {"event": "token", "data": token}
+                async for token in token_stream:
+                    yield {"event": "token", "data": token}
 
             yield {"event": "done", "data": "[DONE]"}
         except Exception as exc:
