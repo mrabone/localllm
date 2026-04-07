@@ -3,6 +3,7 @@ import json
 import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 from langchain_core.runnables import RunnableConfig
 from mcp.types import TextContent, Tool
@@ -69,6 +70,29 @@ def _make_stream_response(tokens: list[str]):
     return _gen()
 
 
+def _make_memory_client(
+    long_term_content: str = "",
+    window_turns: list | None = None,
+) -> httpx.AsyncClient:
+    """Return an httpx.AsyncClient backed by a mock transport.
+
+    Stubs the three memory REST endpoints used by load_context_node.
+    """
+
+    async def _transport(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if "/memory/long-term/" in path:
+            return httpx.Response(200, json={"content": long_term_content})
+        if "/memory/window/" in path:
+            return httpx.Response(200, json=window_turns or [])
+        if path == "/memory/messages":
+            return httpx.Response(204)
+        return httpx.Response(404)
+
+    transport = httpx.MockTransport(_transport)
+    return httpx.AsyncClient(base_url="http://mcp-test", transport=transport)
+
+
 def _make_base_state(**overrides) -> GraphState:
     """Return a minimal valid GraphState for unit testing individual nodes."""
     mcp_session = AsyncMock()
@@ -79,6 +103,7 @@ def _make_base_state(**overrides) -> GraphState:
         "session_id": str(uuid.uuid4()),
         "user_input": "hello",
         "mcp_session": mcp_session,
+        "memory_http_client": _make_memory_client(),
         "ollama_client": ollama_client,
         "chat_model": "test-chat-model",
         "function_calling_model": "test-fc-model",
@@ -93,8 +118,11 @@ def _make_base_state(**overrides) -> GraphState:
     return state
 
 
-def _stub_call_tool(tool_responses: dict):
-    """Return an AsyncMock for call_tool that dispatches by tool name."""
+def _stub_mcp_call_tool(tool_responses: dict):
+    """Return an AsyncMock for MCP call_tool that dispatches by tool name.
+
+    Used only for model-callable tools (e.g. search_knowledge_base).
+    """
 
     async def _call_tool(name, *, arguments=None, **kwargs):
         text = tool_responses.get(name, "")
@@ -173,7 +201,6 @@ class TestLoadContextNode:
 
     async def test_no_extra_messages_when_context_empty(self):
         state = _make_base_state(user_input="hello")
-        state["mcp_session"].call_tool = _stub_call_tool({})
         result = await load_context_node(state)
         messages = result["messages"]
         assert len(messages) == 2
@@ -181,9 +208,10 @@ class TestLoadContextNode:
         assert messages[1] == {"role": "user", "content": "hello"}
 
     async def test_long_term_memory_injected_after_orientation(self):
-        state = _make_base_state()
-        state["mcp_session"].call_tool = _stub_call_tool(
-            {"load_long_term_memory": "User is a Python developer"}
+        state = _make_base_state(
+            memory_http_client=_make_memory_client(
+                long_term_content="User is a Python developer"
+            )
         )
         result = await load_context_node(state)
         messages = result["messages"]
@@ -197,12 +225,12 @@ class TestLoadContextNode:
             {"role": "user", "content": "prev question"},
             {"role": "assistant", "content": "prev answer"},
         ]
-        state = _make_base_state(user_input="current question")
-        state["mcp_session"].call_tool = _stub_call_tool(
-            {
-                "load_long_term_memory": "some memory",
-                "load_conversation_window": json.dumps(window_turns),
-            }
+        state = _make_base_state(
+            user_input="current question",
+            memory_http_client=_make_memory_client(
+                long_term_content="some memory",
+                window_turns=window_turns,
+            ),
         )
         result = await load_context_node(state)
         messages = result["messages"]
@@ -214,12 +242,12 @@ class TestLoadContextNode:
             {"role": "user", "content": "prev q"},
             {"role": "assistant", "content": "prev a"},
         ]
-        state = _make_base_state(user_input="current q")
-        state["mcp_session"].call_tool = _stub_call_tool(
-            {
-                "load_long_term_memory": "memory facts",
-                "load_conversation_window": json.dumps(window_turns),
-            }
+        state = _make_base_state(
+            user_input="current q",
+            memory_http_client=_make_memory_client(
+                long_term_content="memory facts",
+                window_turns=window_turns,
+            ),
         )
         result = await load_context_node(state)
         messages = result["messages"]
@@ -232,77 +260,139 @@ class TestLoadContextNode:
         assert len(messages) == 5
 
     async def test_malformed_window_json_is_ignored(self):
-        state = _make_base_state(user_input="hello")
-        state["mcp_session"].call_tool = _stub_call_tool(
-            {"load_conversation_window": "not valid json {{"}
+        async def _transport(request: httpx.Request) -> httpx.Response:
+            if "/memory/long-term/" in request.url.path:
+                return httpx.Response(200, json={"content": ""})
+            if "/memory/window/" in request.url.path:
+                return httpx.Response(200, content=b"not valid json {{")
+            if request.url.path == "/memory/messages":
+                return httpx.Response(204)
+            return httpx.Response(404)
+
+        state = _make_base_state(
+            user_input="hello",
+            memory_http_client=httpx.AsyncClient(
+                base_url="http://mcp-test",
+                transport=httpx.MockTransport(_transport),
+            ),
         )
         result = await load_context_node(state)
         messages = result["messages"]
         assert messages[-1] == {"role": "user", "content": "hello"}
 
-    async def test_mcp_failure_is_treated_as_empty_result(self):
-        """A failing MCP call during context gather must not propagate — treated as ''."""
-        state = _make_base_state(user_input="hello")
+    async def test_http_failure_is_treated_as_empty_result(self):
+        """A failing memory HTTP call must not propagate — treated as empty."""
+        call_count = 0
 
-        async def _failing_call_tool(name, *, arguments=None, **kwargs):
-            if name == "load_long_term_memory":
-                raise RuntimeError("network error")
-            return _make_empty_tool_result()
+        async def _transport(request: httpx.Request) -> httpx.Response:
+            nonlocal call_count
+            call_count += 1
+            if "/memory/long-term/" in request.url.path:
+                return httpx.Response(500)
+            if "/memory/window/" in request.url.path:
+                return httpx.Response(200, json=[])
+            if request.url.path == "/memory/messages":
+                return httpx.Response(204)
+            return httpx.Response(404)
 
-        state["mcp_session"].call_tool = AsyncMock(side_effect=_failing_call_tool)
-
+        state = _make_base_state(
+            user_input="hello",
+            memory_http_client=httpx.AsyncClient(
+                base_url="http://mcp-test",
+                transport=httpx.MockTransport(_transport),
+            ),
+        )
         result = await load_context_node(state)
         messages = result["messages"]
         assert messages[0]["role"] == "system"
         assert messages[-1] == {"role": "user", "content": "hello"}
 
-    async def test_load_long_term_memory_called_with_configured_max(self):
-        state = _make_base_state()
-        call_tool_mock = _stub_call_tool({})
-        state["mcp_session"].call_tool = call_tool_mock
+    async def test_long_term_memory_called_with_configured_max(self):
+        requests_seen: list[httpx.Request] = []
+
+        async def _transport(request: httpx.Request) -> httpx.Response:
+            requests_seen.append(request)
+            if "/memory/long-term/" in request.url.path:
+                return httpx.Response(200, json={"content": ""})
+            if "/memory/window/" in request.url.path:
+                return httpx.Response(200, json=[])
+            if request.url.path == "/memory/messages":
+                return httpx.Response(204)
+            return httpx.Response(404)
+
+        state = _make_base_state(
+            memory_http_client=httpx.AsyncClient(
+                base_url="http://mcp-test",
+                transport=httpx.MockTransport(_transport),
+            )
+        )
 
         with patch("server.chat.settings") as mock_settings:
             mock_settings.server_memory_long_term_max = 5
             mock_settings.server_memory_window_size = 10
             await load_context_node(state)
 
-        calls_by_name = {c.args[0]: c for c in call_tool_mock.await_args_list}
-        lt_call = calls_by_name["load_long_term_memory"]
-        assert lt_call.kwargs["arguments"]["long_term_max"] == 5
-        assert lt_call.kwargs["arguments"]["session_id"] == state["session_id"]
+        lt_request = next(
+            r for r in requests_seen if "/memory/long-term/" in r.url.path
+        )
+        assert lt_request.url.params["long_term_max"] == "5"
+        assert state["session_id"] in lt_request.url.path
 
-    async def test_load_conversation_window_called_with_configured_size(self):
-        state = _make_base_state()
-        call_tool_mock = _stub_call_tool({})
-        state["mcp_session"].call_tool = call_tool_mock
+    async def test_conversation_window_called_with_configured_size(self):
+        requests_seen: list[httpx.Request] = []
+
+        async def _transport(request: httpx.Request) -> httpx.Response:
+            requests_seen.append(request)
+            if "/memory/long-term/" in request.url.path:
+                return httpx.Response(200, json={"content": ""})
+            if "/memory/window/" in request.url.path:
+                return httpx.Response(200, json=[])
+            if request.url.path == "/memory/messages":
+                return httpx.Response(204)
+            return httpx.Response(404)
+
+        state = _make_base_state(
+            memory_http_client=httpx.AsyncClient(
+                base_url="http://mcp-test",
+                transport=httpx.MockTransport(_transport),
+            )
+        )
 
         with patch("server.chat.settings") as mock_settings:
             mock_settings.server_memory_long_term_max = 3
             mock_settings.server_memory_window_size = 7
             await load_context_node(state)
 
-        calls_by_name = {c.args[0]: c for c in call_tool_mock.await_args_list}
-        win_call = calls_by_name["load_conversation_window"]
-        assert win_call.kwargs["arguments"]["window_size"] == 7
-        assert win_call.kwargs["arguments"]["session_id"] == state["session_id"]
+        win_request = next(r for r in requests_seen if "/memory/window/" in r.url.path)
+        assert win_request.url.params["window_size"] == "7"
+        assert state["session_id"] in win_request.url.path
 
     async def test_persist_message_called_for_user_turn(self):
-        state = _make_base_state(user_input="user input")
-        call_tool_mock = _stub_call_tool({})
-        state["mcp_session"].call_tool = call_tool_mock
+        persisted: list[dict] = []
 
+        async def _transport(request: httpx.Request) -> httpx.Response:
+            if "/memory/long-term/" in request.url.path:
+                return httpx.Response(200, json={"content": ""})
+            if "/memory/window/" in request.url.path:
+                return httpx.Response(200, json=[])
+            if request.url.path == "/memory/messages":
+                persisted.append(json.loads(request.read()))
+                return httpx.Response(204)
+            return httpx.Response(404)
+
+        state = _make_base_state(
+            user_input="user input",
+            memory_http_client=httpx.AsyncClient(
+                base_url="http://mcp-test",
+                transport=httpx.MockTransport(_transport),
+            ),
+        )
         await load_context_node(state)
 
-        persist_calls = [
-            c for c in call_tool_mock.await_args_list if c.args[0] == "persist_message"
-        ]
-        user_persist = next(
-            (c for c in persist_calls if c.kwargs["arguments"]["role"] == "user"),
-            None,
-        )
+        user_persist = next((p for p in persisted if p.get("role") == "user"), None)
         assert user_persist is not None
-        assert user_persist.kwargs["arguments"]["content"] == "user input"
-        assert user_persist.kwargs["arguments"]["session_id"] == state["session_id"]
+        assert user_persist["content"] == "user input"
+        assert user_persist["session_id"] == state["session_id"]
 
 
 @pytest.mark.asyncio
@@ -625,40 +715,11 @@ class TestGenerateResponseNode:
         state["ollama_client"].chat = AsyncMock(
             return_value=_make_stream_response(["Hello", " there"])
         )
-        call_tool_mock = AsyncMock(return_value=_make_empty_tool_result())
-        state["mcp_session"].call_tool = call_tool_mock
 
         config, _ = _make_node_config()
         result = await generate_response_node(state, config)
 
-        # generate_response_node should return the assembled answer
         assert result["resolved_answer"] == "Hello there"
-
-        # Persistence is NOT done by generate_response_node itself;
-        # it happens in run_chat_graph after all tokens are assembled.
-        # So we should NOT see persist_message calls here.
-        persist_calls = [
-            c for c in call_tool_mock.await_args_list if c.args[0] == "persist_message"
-        ]
-        assert len(persist_calls) == 0, "generate_response_node should not persist"
-
-    async def test_persist_failure_does_not_raise(self):
-        """An error persisting the assistant message must not propagate to the caller."""
-        state = _make_base_state(
-            messages=[{"role": "user", "content": "hi"}],
-        )
-        state["ollama_client"].chat = AsyncMock(
-            return_value=_make_stream_response(["ok"])
-        )
-
-        async def _failing_persist(name, *, arguments=None, **kwargs):
-            raise RuntimeError("db down")
-
-        state["mcp_session"].call_tool = AsyncMock(side_effect=_failing_persist)
-
-        config, _ = _make_node_config()
-        result = await generate_response_node(state, config)
-        assert result["resolved_answer"] == "ok"
 
     async def test_num_ctx_passed_to_ollama(self):
         state = _make_base_state(
