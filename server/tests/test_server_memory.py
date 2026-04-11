@@ -3,7 +3,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from server.memory import create_session, session_exists
+from common.session_store import create_session, session_exists
 
 
 def _make_mock_conn():
