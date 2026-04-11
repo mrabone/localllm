@@ -10,30 +10,37 @@ The project is split into five packages in a `uv` workspace:
 - **`mcp/`** — FastMCP tool server. Exposes memory and RAG tools over StreamableHTTP. Holds the dual-memory system (verbatim sliding window in Postgres + Mem0 semantic fact extraction in PGVector) and the RAG knowledge base. Runs in Docker.
 - **`cli/`** — Thin terminal REPL. Sends user input to the server and renders the streamed response. Named sessions are stored in a local JSON registry at `~/.localllm_sessions.json` (these UUIDs are used as Mem0 user IDs on the server).
 - **`rag/`** — One-shot pipeline that scrapes websites and ingests content into the pgvector store.
-- **`common/`** — Shared utilities used by `server`, `mcp`, and `rag`.
+- **`common/`** — Shared utilities (config base class, session store, DB pool, structured logging) used by `server`, `mcp`, and `rag`.
 
 ### Tool Calling
 
 Each chat turn runs through a **LangGraph state machine** with two distinct model roles:
 
-- **`functiongemma`** (`SERVER_FUNCTION_CALLING_MODEL`) — a dedicated function-calling model that silently decides whether to invoke tools and with what arguments. It never produces user-visible text.
+- **`functiongemma`** (`SERVER_FUNCTION_CALLING_MODEL`) — a dedicated function-calling model that silently decides whether to invoke tools and with what arguments. It never produces user-visible text. Runs with a smaller context window (`SERVER_FUNCTION_CALLING_NUM_CTX`, default 2048) since it only needs to select tools, not generate prose.
 - **`custom-chatbot-model`** (`SERVER_OLLAMA_MODEL`) — the main chat model that generates and streams the final answer. It receives the enriched context (history + memories + any tool results) but never sees the tool schemas.
+
+Tool results are injected into the conversation as `role: "system"` messages. Sending them as `role: "tool"` is not supported by gemma3's chat template and causes corrupted output (garbled text, instruction echoing), so this role is used instead.
 
 The only tool currently exposed to `functiongemma` is **`search_knowledge_base`**, which searches the RAG vector store. The three memory tools (`load_conversation_window`, `load_long_term_memory`, `persist_message`) are tagged `internal` and called directly by the graph — the model never decides when to use them.
 
 The decision loop can repeat up to `SERVER_TOOL_CALL_MAX_LOOPS` times, allowing chained tool calls before the chat model generates its final response.
 
+### Memory Persistence
+
+User and assistant messages are persisted to the MCP server **after** the full streaming response completes, not during the graph run. This prevents Mem0's LLM-based fact extraction from running concurrently with the streaming chat model on a single-GPU Ollama instance (`NUM_PARALLEL=1`), which would corrupt the KV cache. Fact extraction only runs for user-role messages — assistant responses are derived from context and contain no new user facts.
+
 ## Features
 
-- **Interactive CLI chat interface** - Have conversations with a local LLM in your terminal, optionally enriched with your own data via RAG.
-- **Named sessions** - Save and resume conversations by name with `--session <name>`. Each run without a name starts a fresh session.
-- **Knowledge base integration** - Automatically import content from websites to let the assistant answer questions based on your custom data sources.
-- **Tool calling** - A dedicated function-calling model silently decides whether to search the knowledge base to ground each answer. The main chat model then receives the enriched context and streams its reply.
-- **Dual memory system** - Each turn loads a sliding window of recent verbatim turns (Postgres) and extracted long-term semantic facts (Mem0/PGVector). Memory persists across CLI restarts.
-- **Persistent sessions** - Session UUIDs map to Mem0 user IDs, so memories survive restarts and are tied to named sessions.
-- **Customizable system prompt** - The assistant has a friendly, helpful personality defined in `Modelfile`.
-- **No internet required** - Everything runs locally with Docker and Ollama.
-- **Flexible model selection** - Easy to switch between different Ollama models for each role (chat, function calling, embeddings).
+- **Interactive CLI chat interface** — Have conversations with a local LLM in your terminal, optionally enriched with your own data via RAG.
+- **Named sessions** — Save and resume conversations by name with `--session <name>`. Each run without a name starts a fresh session.
+- **Knowledge base integration** — Automatically import content from websites to let the assistant answer questions based on your custom data sources.
+- **Tool calling** — A dedicated function-calling model silently decides whether to search the knowledge base to ground each answer. The main chat model then receives the enriched context and streams its reply.
+- **Dual memory system** — Each turn loads a sliding window of recent verbatim turns (Postgres) and extracted long-term semantic facts (Mem0/PGVector). Memory persists across CLI restarts.
+- **Persistent sessions** — Session UUIDs map to Mem0 user IDs, so memories survive restarts and are tied to named sessions.
+- **Structured JSON logging** — Both `server` and `mcp` emit structured JSON log lines via a shared `UVICORN_LOG_CONFIG` from `common`.
+- **Customizable system prompt** — The assistant has a friendly, helpful personality defined in `Modelfile`.
+- **No internet required** — Everything runs locally with Docker and Ollama.
+- **Flexible model selection** — Easy to switch between different Ollama models for each role (chat, function calling, embeddings).
 
 ## Quick Start
 
@@ -147,12 +154,12 @@ Configured via environment variables in a `.env` file. Copy `.env.example` to ge
 
 - `PG_HOST`, `PG_PORT`, `PG_DATABASE`, `PG_USER`, `PG_PASSWORD` — database connection details.
 - `PG_COLLECTION_NAME` — table name for pgvector embeddings (used by RAG pipeline and knowledge base search).
-- `MEM0_COLLECTION_NAME` — PGVector collection used by Mem0 to store extracted semantic memories.
-- `MEM0_LLM_MODEL` — Ollama model used by Mem0 internally to extract semantic facts from conversations.
+- `MEM0_COLLECTION_NAME` — PGVector collection used by Mem0 to store extracted semantic memories (default: `mem0_chat`).
+- `MEM0_LLM_MODEL` — Ollama model used by Mem0 internally to extract semantic facts from conversations (default: `custom-chatbot-model`).
 
 ### RAG Pipeline
 
-- `RAG_OLLAMA_MODEL` — Ollama model used to generate embeddings (also used by Mem0 for vector storage).
+- `RAG_OLLAMA_MODEL` — Ollama model used to generate embeddings (also used by Mem0 for vector storage). Must produce 768-dimensional vectors (default: `embeddinggemma`).
 - `CONCURRENT_REQUESTS` — number of concurrent requests when scraping websites.
 - `REQUEST_DELAY` — delay in seconds between scrape requests.
 - `CHUNKER_BREAKPOINT_TYPE` — chunking strategy for the semantic chunker (default: `percentile`).
@@ -168,12 +175,14 @@ Configured via environment variables in a `.env` file. Copy `.env.example` to ge
 
 ### Server
 
-- `SERVER_OLLAMA_MODEL` — Ollama model used to generate chat responses.
+- `SERVER_OLLAMA_MODEL` — Ollama model used to generate chat responses (default: `custom-chatbot-model`).
 - `SERVER_FUNCTION_CALLING_MODEL` — Ollama model used to decide tool calls (default: `functiongemma`).
-- `SERVER_OLLAMA_NUM_CTX` — context window size for Ollama model calls (default: `8192`).
+- `SERVER_OLLAMA_NUM_CTX` — context window size for the main chat model (default: `8192`).
+- `SERVER_FUNCTION_CALLING_NUM_CTX` — context window size for the function-calling model (default: `2048`). Kept smaller than the chat model since tool selection requires less context.
+- `SERVER_MCP_POOL_SIZE` — number of persistent MCP client connections kept in the pool (default: `4`).
 - `SERVER_MEMORY_WINDOW_SIZE` — number of recent verbatim turns loaded into context per request (default: `10`).
 - `SERVER_MEMORY_LONG_TERM_MAX` — maximum number of Mem0 semantic facts injected as a system message (default: `3`).
-- `SERVER_TOOL_CALL_MAX_LOOPS` — maximum number of decide→execute tool-call loop iterations before forcing a response.
+- `SERVER_TOOL_CALL_MAX_LOOPS` — maximum number of decide→execute tool-call loop iterations before forcing a response (default: `3`).
 - `SERVER_HOST` / `SERVER_PORT` — host and port the server binds to inside Docker.
 
 ### CLI
@@ -222,3 +231,5 @@ To swap a model:
    docker compose restart server   # for SERVER_OLLAMA_MODEL or SERVER_FUNCTION_CALLING_MODEL
    docker compose restart mcp      # for RAG_OLLAMA_MODEL or MEM0_LLM_MODEL
    ```
+
+4. If swapping the embedding model, note that the vector dimensions must match `EMBEDDING_DIMS` (currently hardcoded to `768` in `mcp/src/mcp_server/services.py`). You will also need to re-run the RAG pipeline to regenerate embeddings.
