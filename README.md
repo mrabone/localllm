@@ -7,7 +7,7 @@ Personal project where I experiment with LLMs locally.
 The project is split into five packages in a `uv` workspace:
 
 - **`server/`** — FastAPI HTTP server. Owns all chat logic: session management, conversation memory, RAG context injection, tool calling orchestration, and streaming responses via SSE. Runs in Docker.
-- **`mcp/`** — FastMCP tool server. Exposes memory and RAG tools over StreamableHTTP. Holds the dual-memory system (verbatim sliding window in Postgres + Mem0 semantic fact extraction in PGVector) and the RAG knowledge base. Runs in Docker.
+- **`mcp/`** — FastMCP tool server. Exposes the RAG `search_knowledge_base` tool over StreamableHTTP and serves memory operations as plain REST endpoints. Holds the dual-memory system (verbatim sliding window in Postgres + Mem0 semantic fact extraction in PGVector) and the RAG knowledge base. Runs in Docker.
 - **`cli/`** — Thin terminal REPL. Sends user input to the server and renders the streamed response. Named sessions are stored in a local JSON registry at `~/.localllm_sessions.json` (these UUIDs are used as Mem0 user IDs on the server).
 - **`rag/`** — One-shot pipeline that scrapes websites and ingests content into the pgvector store.
 - **`common/`** — Shared utilities (config base class, session store, DB pool, structured logging) used by `server`, `mcp`, and `rag`.
@@ -21,7 +21,7 @@ Each chat turn runs through a **LangGraph state machine** with two distinct mode
 
 Tool results are injected into the conversation as `role: "system"` messages. Sending them as `role: "tool"` is not supported by gemma3's chat template and causes corrupted output (garbled text, instruction echoing), so this role is used instead.
 
-The only tool currently exposed to `functiongemma` is **`search_knowledge_base`**, which searches the RAG vector store. The three memory tools (`load_conversation_window`, `load_long_term_memory`, `persist_message`) are tagged `internal` and called directly by the graph — the model never decides when to use them.
+The only tool currently exposed to `functiongemma` is **`search_knowledge_base`**, which searches the RAG vector store. Memory operations (loading the conversation window, loading long-term facts, persisting messages) are not MCP tools — they are plain REST endpoints on the MCP server called directly by the graph via HTTP. The model never sees them.
 
 The decision loop can repeat up to `SERVER_TOOL_CALL_MAX_LOOPS` times, allowing chained tool calls before the chat model generates its final response.
 
@@ -61,7 +61,7 @@ User and assistant messages are persisted to the MCP server **after** the full s
    ```bash
    make setup
    ```
-   On first run, Ollama will pull the embedding model and build the custom chat model from `Modelfile`. This can take a few minutes.
+   On first run, Ollama will pull the embedding model (`embeddinggemma`) and the function-calling model (`functiongemma`), and build the custom chat model from `Modelfile`. This can take a few minutes.
 
 3. **Install local dependencies:**
    ```bash
@@ -153,8 +153,8 @@ Configured via environment variables in a `.env` file. Copy `.env.example` to ge
 ### PostgreSQL / Mem0 PGVector
 
 - `PG_HOST`, `PG_PORT`, `PG_DATABASE`, `PG_USER`, `PG_PASSWORD` — database connection details.
-- `PG_COLLECTION_NAME` — table name for pgvector embeddings (used by RAG pipeline and knowledge base search).
-- `MEM0_COLLECTION_NAME` — PGVector collection used by Mem0 to store extracted semantic memories (default: `mem0_chat`).
+- `PG_COLLECTION_NAME` — table name for pgvector embeddings (used by RAG pipeline and knowledge base search). Note: this variable is not injected into the Docker services, so it only takes effect when running services locally outside Docker (e.g. `make run-mcp`).
+- `MEM0_COLLECTION_NAME` — PGVector collection used by Mem0 to store extracted semantic memories (default: `mem0_chat`). Same caveat applies: not passed to Docker services.
 - `MEM0_LLM_MODEL` — Ollama model used by Mem0 internally to extract semantic facts from conversations (default: `custom-chatbot-model`).
 
 ### RAG Pipeline
