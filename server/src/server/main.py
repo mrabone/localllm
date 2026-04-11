@@ -12,7 +12,7 @@ from sse_starlette.sse import EventSourceResponse
 from common.db_pool import is_pool_healthy
 from server.chat import run_chat_graph
 from server.config import settings
-from server.memory import create_session, session_exists
+from common.session_store import create_session, session_exists
 from server.services import (
     FunctionCallingModelDep,
     McpSessionPoolDep,
