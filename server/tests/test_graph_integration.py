@@ -1,67 +1,22 @@
+import asyncio
 import json
 import uuid
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
-import pytest_asyncio
-from mcp.types import TextContent, Tool
+from mcp.types import Tool
 
 from server.chat import Role, run_chat_graph
-
-_open_clients: list[httpx.AsyncClient] = []
-
-
-@pytest_asyncio.fixture(autouse=True)
-async def close_memory_clients():
-    """Close any httpx.AsyncClient instances registered via _make_memory_client
-    or created inline in tests, to prevent resource-leak warnings."""
-    yield
-    for client in _open_clients:
-        await client.aclose()
-    _open_clients.clear()
-
-
-def _make_mcp_tool(
-    name: str, description: str = "", params: dict | None = None
-) -> Tool:
-    """Build a minimal MCP Tool with the given name and input schema."""
-    return Tool(
-        name=name,
-        description=description,
-        inputSchema={
-            "type": "object",
-            "properties": params or {},
-            "required": list((params or {}).keys()),
-        },
-    )
-
-
-def _make_tool_result(text: str):
-    """Return a mock MCP call_tool result with a real TextContent item."""
-    content_item = TextContent(type="text", text=text)
-    result = MagicMock()
-    result.content = [content_item]
-    return result
-
-
-def _make_empty_tool_result():
-    """Return a mock MCP call_tool result with no content."""
-    result = MagicMock()
-    result.content = []
-    return result
-
-
-def _make_stream_response(tokens: list[str]):
-    """Return an async generator that yields mock stream chunks."""
-
-    async def _gen():
-        for token in tokens:
-            chunk = MagicMock()
-            chunk.message.content = token
-            yield chunk
-
-    return _gen()
+from server.config import settings
+from tests.helpers import (
+    _make_client_with_transport,
+    _make_empty_tool_result,
+    _make_mcp_tool,
+    _make_memory_client,
+    _make_stream_response,
+    _make_tool_result,
+)
 
 
 def _stub_mcp_call_tool(tool_responses: dict):
@@ -91,32 +46,6 @@ def _make_fc_tool_call(name: str, arguments: dict | None = None):
     tc.function.name = name
     tc.function.arguments = arguments or {}
     return tc
-
-
-def _make_memory_client(
-    long_term_content: str = "",
-    window_turns: list | None = None,
-) -> httpx.AsyncClient:
-    """Return a real httpx.AsyncClient backed by a mock transport.
-
-    Stubs the three memory REST endpoints so tests don't need a live server.
-    The client is registered for automatic cleanup by the close_memory_clients fixture.
-    """
-
-    async def _transport(request: httpx.Request) -> httpx.Response:
-        path = request.url.path
-        if "/memory/long-term/" in path:
-            return httpx.Response(200, json={"content": long_term_content})
-        if "/memory/window/" in path:
-            return httpx.Response(200, json=window_turns or [])
-        if path == "/memory/messages":
-            return httpx.Response(204)
-        return httpx.Response(404)
-
-    transport = httpx.MockTransport(_transport)
-    client = httpx.AsyncClient(base_url="http://mcp-test", transport=transport)
-    _open_clients.append(client)
-    return client
 
 
 async def _run_graph(
@@ -152,7 +81,9 @@ async def _run_graph(
         function_calling_model="test-fc",
         mcp_tools=mcp_tools or [],
     )
-    return [token async for token in stream]
+    tokens = [token async for token in stream]
+    await asyncio.sleep(0)
+    return tokens
 
 
 @pytest.mark.asyncio
@@ -181,11 +112,7 @@ class TestTokenStreaming:
                 return httpx.Response(204)
             return httpx.Response(404)
 
-        client = httpx.AsyncClient(
-            base_url="http://mcp-test",
-            transport=httpx.MockTransport(_transport),
-        )
-        _open_clients.append(client)
+        client = _make_client_with_transport(_transport)
 
         await _run_graph(memory_http_client=client)
 
@@ -246,11 +173,7 @@ class TestTokenStreaming:
                 return httpx.Response(204)
             return httpx.Response(404)
 
-        client = httpx.AsyncClient(
-            base_url="http://mcp-test",
-            transport=httpx.MockTransport(_transport),
-        )
-        _open_clients.append(client)
+        client = _make_client_with_transport(_transport)
         ollama_client = AsyncMock()
         ollama_client.chat = AsyncMock(
             return_value=_make_stream_response(["Complete", " response"])
@@ -354,7 +277,8 @@ class TestContextMessageOrder:
 
 @pytest.mark.asyncio
 class TestPersistMessages:
-    async def test_user_message_persisted_before_stream(self):
+    async def test_user_message_persisted_after_stream(self):
+        """User message is persisted after streaming to avoid concurrent Ollama calls."""
         persisted: list[dict] = []
 
         async def _transport(request: httpx.Request) -> httpx.Response:
@@ -367,11 +291,7 @@ class TestPersistMessages:
                 return httpx.Response(204)
             return httpx.Response(404)
 
-        client = httpx.AsyncClient(
-            base_url="http://mcp-test",
-            transport=httpx.MockTransport(_transport),
-        )
-        _open_clients.append(client)
+        client = _make_client_with_transport(_transport)
         ollama_client = AsyncMock()
         ollama_client.chat = AsyncMock(return_value=_make_stream_response(["ok"]))
 
@@ -398,11 +318,7 @@ class TestPersistMessages:
                 return httpx.Response(204)
             return httpx.Response(404)
 
-        client = httpx.AsyncClient(
-            base_url="http://mcp-test",
-            transport=httpx.MockTransport(_transport),
-        )
-        _open_clients.append(client)
+        client = _make_client_with_transport(_transport)
         ollama_client = AsyncMock()
         ollama_client.chat = AsyncMock(
             return_value=_make_stream_response(["Hello", " there"])
@@ -433,11 +349,7 @@ class TestPersistMessages:
                 return httpx.Response(500)
             return httpx.Response(404)
 
-        client = httpx.AsyncClient(
-            base_url="http://mcp-test",
-            transport=httpx.MockTransport(_transport),
-        )
-        _open_clients.append(client)
+        client = _make_client_with_transport(_transport)
         ollama_client = AsyncMock()
         ollama_client.chat = AsyncMock(return_value=_make_stream_response(["ok"]))
 
@@ -445,6 +357,33 @@ class TestPersistMessages:
             memory_http_client=client, ollama_client=ollama_client
         )
         assert "".join(tokens) == "ok"
+
+    async def test_user_persisted_before_assistant(self):
+        """User message must be persisted before assistant to maintain turn order."""
+        persist_order: list[str] = []
+
+        async def _transport(request: httpx.Request) -> httpx.Response:
+            if "/memory/long-term/" in request.url.path:
+                return httpx.Response(200, json={"content": ""})
+            if "/memory/window/" in request.url.path:
+                return httpx.Response(200, json=[])
+            if request.url.path == "/memory/messages":
+                body = json.loads(request.read())
+                persist_order.append(body["role"])
+                return httpx.Response(204)
+            return httpx.Response(404)
+
+        client = _make_client_with_transport(_transport)
+        ollama_client = AsyncMock()
+        ollama_client.chat = AsyncMock(return_value=_make_stream_response(["response"]))
+
+        await _run_graph(
+            user_input="my question",
+            memory_http_client=client,
+            ollama_client=ollama_client,
+        )
+
+        assert persist_order == ["user", "assistant"]
 
 
 @pytest.mark.asyncio
@@ -523,7 +462,12 @@ class TestToolCallingLoop:
         assert "".join(tokens) == "Based on docs, answer is 42."
         generate_call_kwargs = ollama_client.chat.call_args_list[-1][1]
         messages = generate_call_kwargs["messages"]
-        tool_msgs = [m for m in messages if m.get("role") == Role.TOOL.value]
+        tool_msgs = [
+            m
+            for m in messages
+            if m.get("role") == Role.SYSTEM.value
+            and "[Tool result" in m.get("content", "")
+        ]
         assert len(tool_msgs) >= 1
         assert any("The answer is in document 3." in m["content"] for m in tool_msgs)
 
@@ -546,8 +490,6 @@ class TestToolCallingLoop:
 
         ollama_client = AsyncMock()
         ollama_client.chat = AsyncMock(side_effect=_chat_side_effect)
-
-        from server.config import settings
 
         await _run_graph(
             mcp_tools=[tool],
@@ -589,7 +531,7 @@ class TestToolCallingLoop:
         error_msgs = [
             m
             for m in generate_call_messages
-            if m.get("role") == Role.TOOL.value and "ERROR" in m["content"]
+            if m.get("role") == Role.SYSTEM.value and "ERROR" in m["content"]
         ]
         assert len(error_msgs) >= 1
         assert any("fake_tool" in m["content"] for m in error_msgs)
@@ -633,12 +575,12 @@ class TestToolCallingLoop:
         error_msgs = [
             m
             for m in generate_call_messages
-            if m.get("role") == Role.TOOL.value and "ERROR" in m["content"]
+            if m.get("role") == Role.SYSTEM.value and "ERROR" in m["content"]
         ]
         assert len(error_msgs) >= 1
 
     async def test_empty_tool_result_replaced_with_fallback(self):
-        """When a tool returns no content the LLM receives an explicit fallback message."""
+        """When a tool returns no content the LLM receives a neutral fallback message."""
         tool = _make_mcp_tool("search_kb", "Search", {"query": {"type": "string"}})
         mcp_session = AsyncMock()
 
@@ -669,6 +611,9 @@ class TestToolCallingLoop:
 
         generate_call_messages = ollama_client.chat.call_args_list[-1][1]["messages"]
         tool_msgs = [
-            m for m in generate_call_messages if m.get("role") == Role.TOOL.value
+            m
+            for m in generate_call_messages
+            if m.get("role") == Role.SYSTEM.value
+            and "[Tool result" in m.get("content", "")
         ]
-        assert any("No results found" in m["content"] for m in tool_msgs)
+        assert any("No tool output was returned." in m["content"] for m in tool_msgs)
