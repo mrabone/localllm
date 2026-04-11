@@ -241,7 +241,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     ensure_turns_table(pg_dsn)
     logger.info("PostgreSQL pool and schema ready.")
 
-    memory_http_client = httpx.AsyncClient(base_url=settings.mcp_server_url, timeout=10)
+    memory_http_client = httpx.AsyncClient(
+        base_url=settings.mcp_server_url,
+        timeout=httpx.Timeout(connect=10.0, read=120.0, write=10.0, pool=10.0),
+    )
 
     mcp_url = f"{settings.mcp_server_url}/mcp"
     logger.info(
@@ -304,7 +307,7 @@ def get_pg_dsn() -> str:
 def get_mcp_tools() -> list[Tool]:
     container = ServiceContainer.get_or_none()
     if container is None:
-        return []
+        raise HTTPException(status_code=503, detail="services not initialised")
     return list(container.mcp_tools)
 
 
