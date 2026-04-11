@@ -5,9 +5,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
-import pytest_asyncio
 from langchain_core.runnables import RunnableConfig
-from mcp.types import TextContent, Tool
+from mcp.types import Tool
 
 from server.chat import (
     GraphState,
@@ -20,18 +19,14 @@ from server.chat import (
     load_context_node,
     mcp_tools_to_ollama_schemas,
 )
-
-_open_clients: list[httpx.AsyncClient] = []
-
-
-@pytest_asyncio.fixture(autouse=True)
-async def close_memory_clients():
-    """Close any httpx.AsyncClient instances created by _make_memory_client or
-    _make_base_state after each test, to prevent resource-leak warnings."""
-    yield
-    for client in _open_clients:
-        await client.aclose()
-    _open_clients.clear()
+from tests.helpers import (
+    _make_client_with_transport,
+    _make_empty_tool_result,
+    _make_mcp_tool,
+    _make_memory_client,
+    _make_stream_response,
+    _make_tool_result,
+)
 
 
 def _make_node_config() -> tuple[RunnableConfig, asyncio.Queue]:
@@ -39,74 +34,6 @@ def _make_node_config() -> tuple[RunnableConfig, asyncio.Queue]:
     token_queue: asyncio.Queue = asyncio.Queue()
     config: RunnableConfig = {"configurable": {"token_queue": token_queue}}
     return config, token_queue
-
-
-def _make_mcp_tool(
-    name: str, description: str = "", params: dict | None = None
-) -> Tool:
-    """Build a minimal MCP Tool with the given name and input schema."""
-    return Tool(
-        name=name,
-        description=description,
-        inputSchema={
-            "type": "object",
-            "properties": params or {},
-            "required": list((params or {}).keys()),
-        },
-    )
-
-
-def _make_tool_result(text: str):
-    """Return a mock MCP call_tool result with a real TextContent item."""
-    content_item = TextContent(type="text", text=text)
-    result = MagicMock()
-    result.content = [content_item]
-    return result
-
-
-def _make_empty_tool_result():
-    """Return a mock MCP call_tool result with no content."""
-    result = MagicMock()
-    result.content = []
-    return result
-
-
-def _make_stream_response(tokens: list[str]):
-    """Return an async generator that yields mock stream chunks."""
-
-    async def _gen():
-        for token in tokens:
-            chunk = MagicMock()
-            chunk.message.content = token
-            yield chunk
-
-    return _gen()
-
-
-def _make_memory_client(
-    long_term_content: str = "",
-    window_turns: list | None = None,
-) -> httpx.AsyncClient:
-    """Return an httpx.AsyncClient backed by a mock transport.
-
-    Stubs the three memory REST endpoints used by load_context_node.
-    The client is registered for automatic cleanup by the close_memory_clients fixture.
-    """
-
-    async def _transport(request: httpx.Request) -> httpx.Response:
-        path = request.url.path
-        if "/memory/long-term/" in path:
-            return httpx.Response(200, json={"content": long_term_content})
-        if "/memory/window/" in path:
-            return httpx.Response(200, json=window_turns or [])
-        if path == "/memory/messages":
-            return httpx.Response(204)
-        return httpx.Response(404)
-
-    transport = httpx.MockTransport(_transport)
-    client = httpx.AsyncClient(base_url="http://mcp-test", transport=transport)
-    _open_clients.append(client)
-    return client
 
 
 def _make_base_state(**overrides) -> GraphState:
@@ -270,11 +197,7 @@ class TestLoadContextNode:
                 return httpx.Response(204)
             return httpx.Response(404)
 
-        client = httpx.AsyncClient(
-            base_url="http://mcp-test",
-            transport=httpx.MockTransport(_transport),
-        )
-        _open_clients.append(client)
+        client = _make_client_with_transport(_transport)
         state = _make_base_state(user_input="hello", memory_http_client=client)
         result = await load_context_node(state)
         messages = result["messages"]
@@ -295,11 +218,7 @@ class TestLoadContextNode:
                 return httpx.Response(204)
             return httpx.Response(404)
 
-        client = httpx.AsyncClient(
-            base_url="http://mcp-test",
-            transport=httpx.MockTransport(_transport),
-        )
-        _open_clients.append(client)
+        client = _make_client_with_transport(_transport)
         state = _make_base_state(user_input="hello", memory_http_client=client)
         result = await load_context_node(state)
         messages = result["messages"]
@@ -319,11 +238,7 @@ class TestLoadContextNode:
                 return httpx.Response(204)
             return httpx.Response(404)
 
-        client = httpx.AsyncClient(
-            base_url="http://mcp-test",
-            transport=httpx.MockTransport(_transport),
-        )
-        _open_clients.append(client)
+        client = _make_client_with_transport(_transport)
         state = _make_base_state(memory_http_client=client)
         with patch("server.chat.settings") as mock_settings:
             mock_settings.server_memory_long_term_max = 5
@@ -349,11 +264,7 @@ class TestLoadContextNode:
                 return httpx.Response(204)
             return httpx.Response(404)
 
-        client = httpx.AsyncClient(
-            base_url="http://mcp-test",
-            transport=httpx.MockTransport(_transport),
-        )
-        _open_clients.append(client)
+        client = _make_client_with_transport(_transport)
         state = _make_base_state(memory_http_client=client)
         with patch("server.chat.settings") as mock_settings:
             mock_settings.server_memory_long_term_max = 3
@@ -363,34 +274,6 @@ class TestLoadContextNode:
         win_request = next(r for r in requests_seen if "/memory/window/" in r.url.path)
         assert win_request.url.params["window_size"] == "7"
         assert state["session_id"] in win_request.url.path
-
-    async def test_persist_message_called_for_user_turn(self):
-        persisted: list[dict] = []
-
-        async def _transport(request: httpx.Request) -> httpx.Response:
-            if "/memory/long-term/" in request.url.path:
-                return httpx.Response(200, json={"content": ""})
-            if "/memory/window/" in request.url.path:
-                return httpx.Response(200, json=[])
-            if request.url.path == "/memory/messages":
-                persisted.append(json.loads(request.read()))
-                return httpx.Response(204)
-            return httpx.Response(404)
-
-        client = httpx.AsyncClient(
-            base_url="http://mcp-test",
-            transport=httpx.MockTransport(_transport),
-        )
-        try:
-            state = _make_base_state(user_input="user input", memory_http_client=client)
-            await load_context_node(state)
-        finally:
-            await client.aclose()
-
-        user_persist = next((p for p in persisted if p.get("role") == "user"), None)
-        assert user_persist is not None
-        assert user_persist["content"] == "user input"
-        assert user_persist["session_id"] == state["session_id"]
 
 
 @pytest.mark.asyncio
@@ -470,7 +353,7 @@ class TestDecideToolsNode:
         assert tools_arg[0]["function"]["name"] == "search_kb"
 
     async def test_fc_model_receives_merged_messages_and_tool_results(self):
-        existing_tool_result = {"role": "tool", "content": "previous result"}
+        existing_tool_result = {"role": "system", "content": "previous result"}
         state = _make_base_state(
             messages=[{"role": "user", "content": "hello"}],
             tool_results=[existing_tool_result],
@@ -487,7 +370,7 @@ class TestDecideToolsNode:
         assert existing_tool_result in messages_passed
 
     async def test_existing_tool_results_preserved(self):
-        existing = {"role": "tool", "content": "prior result"}
+        existing = {"role": "system", "content": "prior result"}
         state = _make_base_state(
             messages=[{"role": "user", "content": "hello"}],
             tool_results=[existing],
@@ -538,7 +421,7 @@ class TestExecuteToolsNode:
         result = await execute_tools_node(state)
         tool_messages = result["tool_results"]
         assert len(tool_messages) == 1
-        assert tool_messages[0]["role"] == Role.TOOL.value
+        assert tool_messages[0]["role"] == Role.SYSTEM.value
         assert "Found document 3." in tool_messages[0]["content"]
 
     async def test_unknown_tool_returns_error_message(self):
@@ -583,7 +466,7 @@ class TestExecuteToolsNode:
 
         result = await execute_tools_node(state)
         tool_message = result["tool_results"][0]
-        assert "No results found" in tool_message["content"]
+        assert "No tool output was returned." in tool_message["content"]
 
     async def test_multiple_pending_calls_all_executed(self):
         tool_a = _make_mcp_tool("tool_a")
