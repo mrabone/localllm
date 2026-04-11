@@ -18,8 +18,6 @@ from server.config import settings
 
 logger = logging.getLogger(__name__)
 
-_background_tasks: set[asyncio.Task] = set()
-
 
 class Role(Enum):
     USER = "user"
@@ -384,11 +382,13 @@ async def run_chat_graph(
     it — without waiting for the full response to complete.
 
     After the stream is exhausted, both the user and assistant messages are
-    persisted via the memory HTTP endpoint in a single background task.
+    persisted via the memory HTTP endpoint by awaiting ``_persist_turn``.
     Persistence is deferred until after streaming so that mem0's fact-extraction
     LLM call (which uses the same Ollama model) cannot run concurrently with the
     chat model's response — Ollama with ``NUM_PARALLEL=1`` queues requests to the
     same model, and a concurrent extraction request corrupts the KV cache state.
+    Awaiting (rather than fire-and-forgetting) also prevents mem0 extraction for
+    turn N from overlapping with the streaming response for turn N+1.
     """
     initial_state: GraphState = {
         "session_id": str(session_id),
@@ -428,54 +428,65 @@ async def run_chat_graph(
             except (asyncio.CancelledError, Exception):
                 pass
 
+    if not drain_completed:
+        return
+
     final_state = await graph_task
     final_answer = final_state.get("resolved_answer") if final_state else None
 
-    async def _persist_turn() -> None:
-        """Persist user and assistant messages sequentially after streaming.
+    await _persist_turn(session_id, user_input, final_answer, memory_http_client)
 
-        User message is persisted first to maintain chronological order in
-        the conversation_turns table.  Both calls go through the MCP memory
-        endpoint which handles sliding-window storage and mem0 extraction.
-        """
-        str_session_id = str(session_id)
+
+async def _persist_turn(
+    session_id: uuid.UUID,
+    user_input: str,
+    final_answer: str | None,
+    memory_http_client: httpx.AsyncClient,
+) -> None:
+    """Persist user and assistant messages sequentially after streaming.
+
+    User message is persisted first to maintain chronological order in
+    the conversation_turns table.  Both calls go through the MCP memory
+    endpoint which handles sliding-window storage and mem0 extraction.
+
+    Awaited directly (not fire-and-forget) so that mem0 fact extraction for
+    turn N cannot run concurrently with streaming for turn N+1 on a
+    single-GPU Ollama instance.
+    """
+    str_session_id = str(session_id)
+    try:
+        response = await memory_http_client.post(
+            "/memory/messages",
+            json={
+                "session_id": str_session_id,
+                "role": Role.USER.value,
+                "content": user_input,
+            },
+        )
+        response.raise_for_status()
+    except Exception as exc:
+        logger.error(
+            "Failed to persist user message (session=%s): %s",
+            session_id,
+            exc,
+            exc_info=True,
+        )
+
+    if final_answer:
         try:
             response = await memory_http_client.post(
                 "/memory/messages",
                 json={
                     "session_id": str_session_id,
-                    "role": Role.USER.value,
-                    "content": user_input,
+                    "role": Role.ASSISTANT.value,
+                    "content": final_answer,
                 },
             )
             response.raise_for_status()
         except Exception as exc:
             logger.error(
-                "Failed to persist user message (session=%s): %s",
+                "Failed to persist assistant message (session=%s): %s",
                 session_id,
                 exc,
                 exc_info=True,
             )
-
-        if final_answer:
-            try:
-                response = await memory_http_client.post(
-                    "/memory/messages",
-                    json={
-                        "session_id": str_session_id,
-                        "role": Role.ASSISTANT.value,
-                        "content": final_answer,
-                    },
-                )
-                response.raise_for_status()
-            except Exception as exc:
-                logger.error(
-                    "Failed to persist assistant message (session=%s): %s",
-                    session_id,
-                    exc,
-                    exc_info=True,
-                )
-
-    task = asyncio.create_task(_persist_turn())
-    _background_tasks.add(task)
-    task.add_done_callback(_background_tasks.discard)

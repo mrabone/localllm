@@ -1,4 +1,3 @@
-import asyncio
 import json
 import uuid
 from unittest.mock import AsyncMock, MagicMock
@@ -82,7 +81,6 @@ async def _run_graph(
         mcp_tools=mcp_tools or [],
     )
     tokens = [token async for token in stream]
-    await asyncio.sleep(0)
     return tokens
 
 
