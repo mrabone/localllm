@@ -4,7 +4,7 @@ import logging
 import uuid
 from enum import Enum
 from dataclasses import dataclass
-from typing import AsyncGenerator, Literal
+from typing import AsyncGenerator, Literal, TypedDict
 
 import httpx
 from langchain_core.runnables import RunnableConfig
@@ -13,7 +13,6 @@ from langgraph.graph.state import CompiledStateGraph
 from mcp import ClientSession
 from mcp.types import TextContent, Tool
 from ollama import AsyncClient
-from typing_extensions import TypedDict
 
 from server.config import settings
 
@@ -24,7 +23,6 @@ class Role(Enum):
     USER = "user"
     ASSISTANT = "assistant"
     SYSTEM = "system"
-    TOOL = "tool"
 
 
 @dataclass
@@ -35,9 +33,17 @@ class ToolCall:
 
 
 def build_tool_result_message(call_id: str, name: str, content: str) -> dict:
-    """Build a tool result message dictionary to be appended to the conversation."""
+    """Build a tool result message dictionary to be appended to the conversation.
+
+    Uses ``role: "system"`` rather than ``role: "tool"`` because gemma3's chat
+    template does not support a dedicated tool turn type.  Sending tool results
+    as ``role: "tool"`` causes the model to ignore the content and produce
+    corrupted output (multilingual fragments, instruction echoing).  The system
+    role is semantically appropriate — tool results are contextual information
+    — and is handled correctly by gemma3's ``<start_of_turn>`` template.
+    """
     return {
-        "role": Role.TOOL.value,
+        "role": Role.SYSTEM.value,
         "content": f"[Tool result for {name} (id={call_id})]\n{content}",
     }
 
@@ -78,10 +84,17 @@ class GraphState(TypedDict):
 
 
 async def load_context_node(state: GraphState) -> dict:
-    """Load memory, conversation window, and persist the user turn concurrently.
+    """Load memory context for the current turn.
 
-    Issues three HTTP calls in parallel to minimise pre-stream latency.  Failures
-    are logged and treated as empty results so the turn can continue.
+    Long-term memory and the recent conversation window are fetched in parallel
+    to minimise pre-stream latency.
+
+    Persistence of the user message is deliberately NOT done here.  It is
+    deferred to ``run_chat_graph`` so that the mem0 extraction LLM call
+    (which uses the same Ollama model) cannot run concurrently with the chat
+    model's response streaming — Ollama with ``NUM_PARALLEL=1`` queues
+    requests to the same model, and a concurrent extraction request corrupts
+    the KV cache state seen by the streaming response.
     """
     client = state["memory_http_client"]
     session_id = state["session_id"]
@@ -103,29 +116,13 @@ async def load_context_node(state: GraphState) -> dict:
         response.raise_for_status()
         return response.text
 
-    async def persist_user_message() -> None:
-        response = await client.post(
-            "/memory/messages",
-            json={
-                "session_id": session_id,
-                "role": Role.USER.value,
-                "content": user_input,
-            },
-        )
-        response.raise_for_status()
-
     gather_results = await asyncio.gather(
         fetch_long_term_memory(),
         fetch_conversation_window(),
-        persist_user_message(),
         return_exceptions=True,
     )
 
-    call_names = [
-        "load_long_term_memory",
-        "load_conversation_window",
-        "persist_message",
-    ]
+    call_names = ["load_long_term_memory", "load_conversation_window"]
     resolved: list[str] = []
     for name, result in zip(call_names, gather_results):
         if isinstance(result, BaseException):
@@ -139,7 +136,7 @@ async def load_context_node(state: GraphState) -> dict:
         else:
             resolved.append(result or "")  # type: ignore[arg-type]
 
-    long_term_content, window_content, _ = resolved
+    long_term_content, window_content = resolved
 
     orientation = {
         "role": Role.SYSTEM.value,
@@ -269,7 +266,7 @@ async def execute_tools_node(state: GraphState) -> dict:
                 first_content.text if isinstance(first_content, TextContent) else ""
             )
             if not content:
-                content = "No results found. Answer the user's question using your own knowledge."
+                content = "No tool output was returned."
             return build_tool_result_message(call.id, call.name, content)
         except Exception as exc:
             logger.warning(
@@ -281,7 +278,7 @@ async def execute_tools_node(state: GraphState) -> dict:
             )
             error = (
                 f"ERROR: Tool '{call.name}' failed with: {exc}. "
-                "Continue with the information you have."
+                "No tool output is available for this call."
             )
             return build_tool_result_message(call.id, call.name, error)
 
@@ -384,8 +381,14 @@ async def run_chat_graph(
     the queue, yielding each token to the SSE endpoint as soon as Ollama produces
     it — without waiting for the full response to complete.
 
-    After the stream is exhausted the full assembled answer is persisted via the
-    memory HTTP endpoint.
+    After the stream is exhausted, both the user and assistant messages are
+    persisted via the memory HTTP endpoint by awaiting ``_persist_turn``.
+    Persistence is deferred until after streaming so that mem0's fact-extraction
+    LLM call (which uses the same Ollama model) cannot run concurrently with the
+    chat model's response — Ollama with ``NUM_PARALLEL=1`` queues requests to the
+    same model, and a concurrent extraction request corrupts the KV cache state.
+    Awaiting (rather than fire-and-forgetting) also prevents mem0 extraction for
+    turn N from overlapping with the streaming response for turn N+1.
     """
     initial_state: GraphState = {
         "session_id": str(session_id),
@@ -425,15 +428,56 @@ async def run_chat_graph(
             except (asyncio.CancelledError, Exception):
                 pass
 
+    if not drain_completed:
+        return
+
     final_state = await graph_task
     final_answer = final_state.get("resolved_answer") if final_state else None
+
+    await _persist_turn(session_id, user_input, final_answer, memory_http_client)
+
+
+async def _persist_turn(
+    session_id: uuid.UUID,
+    user_input: str,
+    final_answer: str | None,
+    memory_http_client: httpx.AsyncClient,
+) -> None:
+    """Persist user and assistant messages sequentially after streaming.
+
+    User message is persisted first to maintain chronological order in
+    the conversation_turns table.  Both calls go through the MCP memory
+    endpoint which handles sliding-window storage and mem0 extraction.
+
+    Awaited directly (not fire-and-forget) so that mem0 fact extraction for
+    turn N cannot run concurrently with streaming for turn N+1 on a
+    single-GPU Ollama instance.
+    """
+    str_session_id = str(session_id)
+    try:
+        response = await memory_http_client.post(
+            "/memory/messages",
+            json={
+                "session_id": str_session_id,
+                "role": Role.USER.value,
+                "content": user_input,
+            },
+        )
+        response.raise_for_status()
+    except Exception as exc:
+        logger.error(
+            "Failed to persist user message (session=%s): %s",
+            session_id,
+            exc,
+            exc_info=True,
+        )
 
     if final_answer:
         try:
             response = await memory_http_client.post(
                 "/memory/messages",
                 json={
-                    "session_id": str(session_id),
+                    "session_id": str_session_id,
                     "role": Role.ASSISTANT.value,
                     "content": final_answer,
                 },

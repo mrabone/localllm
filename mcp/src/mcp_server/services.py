@@ -13,6 +13,53 @@ from mcp_server.config import settings
 
 logger = logging.getLogger(__name__)
 
+EMBEDDING_DIMS = 768
+
+FACT_EXTRACTION_PROMPT = """\
+Extract personal facts about the user from the conversation below.
+
+Only extract facts that would be useful to remember across future conversations, such as:
+- Name, location, occupation, or relationships
+- Preferences, opinions, or interests
+- Goals, plans, or ongoing projects
+- Technical background or skill level
+
+Do NOT extract:
+- Greetings, small talk, or pleasantries
+- The user's current question or request (that is not a lasting fact)
+- Generic statements or common knowledge
+- Anything said by the assistant
+
+Return a JSON object: {"facts": ["fact1", "fact2"]}
+If there is nothing worth remembering, return: {"facts": []}
+
+Examples:
+
+Input:
+User: Hi there, how are you?
+Output: {"facts": []}
+
+Input:
+User: What is Python?
+Output: {"facts": []}
+
+Input:
+User: Thanks, that was helpful!
+Output: {"facts": []}
+
+Input:
+User: I'm a data scientist working at Google and I mostly use Python.
+Output: {"facts": ["Works as a data scientist at Google", "Mostly uses Python"]}
+
+Input:
+User: I'm trying to learn Rust because I want to build faster CLI tools.
+Output: {"facts": ["Learning Rust", "Wants to build faster CLI tools"]}
+
+Input:
+User: My name is Sarah and I live in Berlin.
+Output: {"facts": ["Name is Sarah", "Lives in Berlin"]}
+"""
+
 
 class ServiceContainer:
     _instance: "ServiceContainer | None" = None
@@ -53,6 +100,7 @@ async def lifespan(server: FastMCP):
     logger.info("Starting MCP server, initialising services...")
 
     mem0_config = {
+        "custom_fact_extraction_prompt": FACT_EXTRACTION_PROMPT,
         "vector_store": {
             "provider": "pgvector",
             "config": {
@@ -62,7 +110,7 @@ async def lifespan(server: FastMCP):
                 "password": settings.pg_password,
                 "dbname": settings.pg_database,
                 "collection_name": settings.mem0_collection_name,
-                "embedding_model_dims": 768,
+                "embedding_model_dims": EMBEDDING_DIMS,
             },
         },
         "embedder": {
@@ -70,7 +118,7 @@ async def lifespan(server: FastMCP):
             "config": {
                 "model": settings.rag_ollama_model,
                 "ollama_base_url": settings.ollama_base_url,
-                "embedding_dims": 768,
+                "embedding_dims": EMBEDDING_DIMS,
             },
         },
         "llm": {

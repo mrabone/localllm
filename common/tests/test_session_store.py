@@ -3,11 +3,16 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from common.session_store import create_session, session_exists
+from common.session_store import create_session, ensure_turns_table, session_exists
 
 
 def _make_mock_conn():
-    """Return a (mock_conn, mock_cur) pair wired up as context managers."""
+    """Return a (mock_conn, mock_cur) pair wired up as context managers.
+
+    Note: an identical copy exists in mcp/tests/test_memory.py.  Cross-package
+    sharing requires non-trivial pytest path setup, so both copies are kept
+    intentionally.
+    """
     mock_conn = MagicMock()
     mock_cur = MagicMock()
     mock_conn.__enter__ = MagicMock(return_value=mock_conn)
@@ -100,3 +105,25 @@ class TestSessionExists:
 
         _, params = mock_cur.execute.call_args[0]
         assert str(session_id) in params
+
+
+class TestEnsureTurnsTable:
+    def test_executes_create_table_and_index(self):
+        """ensure_turns_table should execute the two CREATE TABLEs and CREATE INDEX."""
+        mock_conn, mock_cur = _make_mock_conn()
+
+        with patch("common.session_store.get_conn", return_value=mock_conn):
+            ensure_turns_table("host=localhost dbname=test")
+
+        assert mock_cur.execute.call_count == 3
+
+    def test_raises_on_db_error(self):
+        """ensure_turns_table should propagate database errors."""
+        mock_conn = MagicMock()
+        mock_conn.__enter__ = MagicMock(return_value=mock_conn)
+        mock_conn.__exit__ = MagicMock(return_value=False)
+        mock_conn.cursor.side_effect = Exception("DB error")
+
+        with patch("common.session_store.get_conn", return_value=mock_conn):
+            with pytest.raises(Exception, match="DB error"):
+                ensure_turns_table("host=localhost dbname=test")

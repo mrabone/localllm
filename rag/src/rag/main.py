@@ -52,7 +52,7 @@ def load_reading_list(file_path: Path) -> list[dict]:
     except json.JSONDecodeError as e:
         logger.error("Failed to decode JSON from %s: %s", file_path, e)
         return []
-    except (OSError, IOError) as e:
+    except OSError as e:
         logger.error("Failed to read file %s: %s", file_path, e)
         return []
 

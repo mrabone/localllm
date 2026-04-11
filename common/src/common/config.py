@@ -73,7 +73,6 @@ class SharedSettings(BaseSettings):
 
         WARNING: do NOT log or format this value directly — SQLAlchemy renders
         the password in plain text when the URL is coerced to a string.
-        Use ``db_url_safe`` for any logging or display.
         """
         return URL.create(
             drivername="postgresql+psycopg2",
@@ -82,16 +81,4 @@ class SharedSettings(BaseSettings):
             host=self.pg_host,
             port=self.pg_port,
             database=self.pg_database,
-        )
-
-    @property
-    def db_url_safe(self) -> str:
-        """Return a redacted connection string safe for logging.
-
-        The password is replaced with ``***`` so the string can be included in
-        log messages or error output without leaking credentials.
-        """
-        return (
-            f"postgresql+psycopg2://{self.pg_user}:***"
-            f"@{self.pg_host}:{self.pg_port}/{self.pg_database}"
         )

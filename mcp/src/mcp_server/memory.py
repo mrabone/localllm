@@ -5,7 +5,6 @@ import psycopg2.extras
 from mem0 import Memory
 
 from common.db_pool import get_conn
-from common.session_store import create_session, ensure_turns_table, session_exists
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +113,20 @@ def load_window(
         return []
 
 
+def should_extract_memories(role: str) -> bool:
+    """Decide whether a message should be sent through Mem0's fact extraction.
+
+    Only user messages are worth extracting — assistant responses are derived
+    from model + context and don't contain facts about the user.  Skipping
+    them avoids a 30-60s LLM round-trip per assistant turn.
+
+    Content-level filtering (greetings, short messages) is handled by mem0's
+    fact extraction prompt, which instructs the LLM to return an empty facts
+    list for trivial inputs.
+    """
+    return role == "user"
+
+
 def save_message(mem0: Memory, session_id: uuid.UUID, role: str, content: str) -> None:
     """Persist a single message to Mem0.
 
@@ -210,10 +223,8 @@ def load_long_term_memories(
 
 __all__ = [
     "append_turn",
-    "create_session",
-    "ensure_turns_table",
     "load_long_term_memories",
     "load_window",
     "save_message",
-    "session_exists",
+    "should_extract_memories",
 ]
